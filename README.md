@@ -1,7 +1,9 @@
 # World Simulator v2
 
+**Live:** https://world-simulator-indol.vercel.app
+
 Real-time multi-agent sandbox — the research groundwork for Marketrix's simulation engine.
-Four live domains, one dark mission-control shell, all running custom agent logic on Three.js.
+Four live domains in one control-room shell, all running custom agent logic on Three.js.
 
 ## Domains
 
