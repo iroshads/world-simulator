@@ -12,6 +12,14 @@ dist
 dist-ssr
 *.local
 
+# Env & deploy
+.env
+.env.*
+.vercel
+
+# Local agent/editor tooling
+.claude
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

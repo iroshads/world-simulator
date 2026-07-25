@@ -1,5 +1,5 @@
 {
   "name": "World Simulator",
-  "description": "A futuristic dashboard visualizing the unification of simulation domains towards AGI.",
+  "description": "Real-time multi-agent sandbox for simulating cities, traffic networks, robot fleets and social graphs.",
   "requestFramePermissions": []
 }

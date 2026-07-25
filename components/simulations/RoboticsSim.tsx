@@ -1,452 +1,658 @@
-
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef } from 'react';
 import * as THREE from 'three';
-import { useThreeSim } from '../../hooks/useThreeSim';
+import { useThreeSim, SimContext } from '../../hooks/useThreeSim';
 import { SimProps } from '../../types';
-import { Power, RotateCcw, BatteryWarning } from 'lucide-react';
 
-const MAT = {
-    base: new THREE.MeshStandardMaterial({ color: 0xffffff }), 
-    hover: new THREE.MeshBasicMaterial({ color: 0xff00ff, wireframe: true, transparent: true, opacity: 0.6 }),
-};
+/**
+ * Autonomous warehouse: a fleet of humanoid robots working a shared task queue.
+ * Packages appear on shelf racks; robots claim the nearest task, A* to it
+ * (treating other robots as dynamic obstacles), carry the package to a dispatch
+ * dock, and manage their own battery — queueing at chargers when low.
+ */
 
-export const RoboticsSim: React.FC<SimProps> = React.memo(({ settings, activeTool, active, zoom, onUpdateMetrics, onHover }) => {
-    const GRID = 20;
-    const gridRef = useRef<number[]>([]); 
-    const meshRef = useRef<THREE.InstancedMesh>(null);
-    const robotRef = useRef<THREE.Group>(null);
-    const lidarLinesRef = useRef<THREE.LineSegments>(null);
-    const pathLinesRef = useRef<THREE.Line>(null); // Visualizer for path
-    const targetRef = useRef<THREE.Mesh>(null);
-    const cursorRef = useRef<THREE.Mesh>(null);
-    const planeRef = useRef<THREE.Mesh>(null);
-    const clickMarkerRef = useRef<THREE.Mesh>(null);
-    const chargerRef = useRef<THREE.Group>(null); 
-    
-    // UI State for Dead Robot
-    const [isDead, setIsDead] = useState(false);
-    const isDeadRef = useRef(false); // To sync with animation loop without re-renders
+const GRID = 22;
+const OFF = GRID / 2;
 
-    // Ensure activeTool is always fresh in the render loop without re-init
-    const activeToolRef = useRef(activeTool);
-    useEffect(() => { activeToolRef.current = activeTool; }, [activeTool]);
+type BotStatus = 'IDLE' | 'TO_PICKUP' | 'PICKING' | 'TO_DOCK' | 'DROPPING' | 'TO_CHARGER' | 'CHARGING' | 'STUCK';
 
-    const stateRef = useRef({
-        pos: new THREE.Vector3(0.5, 0, 0.5), 
-        target: new THREE.Vector3(0.5, 0, 0.5), 
-        angle: 0,
-        status: 'IDLE' as 'IDLE'|'MOVING'|'BLOCKED'|'WORKING'|'CHARGING'|'RETURNING'|'DEAD', 
-        workTimer: 0, 
-        path: [] as THREE.Vector3[], 
-        pathIdx: 0,
-        battery: 100, 
-        isGoingToCharge: false,
-        blockedRetries: 0
-    });
-    const autoTaskTimer = useRef(0);
-    
-    // Materials
-    const ROBOT_MAT = { 
-        white: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.2 }), 
-        black: new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.4 }), 
-        visor: new THREE.MeshStandardMaterial({ color: 0x06b6d4, roughness: 0.1, metalness: 0.8, emissive: 0x06b6d4, emissiveIntensity: 0.5 }), 
-        joint: new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.3, metalness: 0.3 }) 
+interface Task { cell: number; claimed: number; } // claimed: robot idx or -1
+interface Bot {
+    id: number;
+    pos: THREE.Vector3;
+    angle: number;
+    status: BotStatus;
+    path: number[];
+    pathIdx: number;
+    battery: number;
+    task: number;      // index into tasks, -1 none
+    timer: number;
+    stuck: number;
+    delivered: number;
+    model: THREE.Group;
+    carry: THREE.Mesh;
+}
+
+export const RoboticsSim: React.FC<SimProps> = React.memo(({ settings, active, activeTool, zoom, timeScale, onUpdateMetrics, onHover, onEvent }) => {
+    const walls = useRef<Uint8Array>(new Uint8Array(GRID * GRID));
+    const tasks = useRef<Task[]>([]);
+    const bots = useRef<Bot[]>([]);
+    const stats = useRef({ delivered: 0, spawnAcc: 0, metricAcc: 0, selected: -1, botSeq: 0, startTime: 0 });
+
+    const floorMesh = useRef<THREE.InstancedMesh | null>(null);
+    const pkgMesh = useRef<THREE.InstancedMesh | null>(null);
+    const singles = useRef<Record<string, any>>({});
+    const sceneRef = useRef<THREE.Scene | null>(null);
+
+    const settingsRef = useRef(settings); settingsRef.current = settings;
+    const toolRef = useRef(activeTool); toolRef.current = activeTool;
+    const cbRef = useRef({ onUpdateMetrics, onHover, onEvent });
+    cbRef.current = { onUpdateMetrics, onHover, onEvent };
+
+    const DOCKS = [GRID * (GRID - 1) + 4, GRID * (GRID - 1) + 10, GRID * (GRID - 1) + 16];
+    const CHARGERS = [0, 1, GRID, GRID + 1];
+
+    const c2xz = (i: number): [number, number] => [(i % GRID) - OFF + 0.5, Math.floor(i / GRID) - OFF + 0.5];
+    const xz2c = (x: number, z: number): number => {
+        const gx = Math.floor(x + OFF), gz = Math.floor(z + OFF);
+        if (gx < 0 || gx >= GRID || gz < 0 || gz >= GRID) return -1;
+        return gz * GRID + gx;
     };
 
+    // ---------- A* ----------
+    const astar = (from: number, to: number, blocked?: Set<number>): number[] | null => {
+        if (from === to) return [];
+        const W = walls.current;
+        const h = (i: number) => Math.abs((i % GRID) - (to % GRID)) + Math.abs(Math.floor(i / GRID) - Math.floor(to / GRID));
+        const open = new Map<number, number>([[from, h(from)]]);
+        const g = new Map<number, number>([[from, 0]]);
+        const prev = new Map<number, number>();
+        const closed = new Set<number>();
+        while (open.size) {
+            let cur = -1, best = Infinity;
+            for (const [k, f] of open) if (f < best) { best = f; cur = k; }
+            if (cur === to) {
+                const path: number[] = [];
+                let c = to;
+                while (c !== from) { path.push(c); c = prev.get(c)!; }
+                return path.reverse();
+            }
+            open.delete(cur); closed.add(cur);
+            const gx = cur % GRID, gz = Math.floor(cur / GRID);
+            for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+                const nx = gx + dx, nz = gz + dz;
+                if (nx < 0 || nx >= GRID || nz < 0 || nz >= GRID) continue;
+                const ni = nz * GRID + nx;
+                if (W[ni] === 1 || closed.has(ni) || (blocked?.has(ni) && ni !== to)) continue;
+                const ng = g.get(cur)! + 1;
+                if (ng < (g.get(ni) ?? Infinity)) {
+                    g.set(ni, ng); prev.set(ni, cur);
+                    open.set(ni, ng + h(ni));
+                }
+            }
+            if (closed.size > 500) return null;
+        }
+        return null;
+    };
+
+    // ---------- robot model ----------
+    const RM = {
+        white: new THREE.MeshStandardMaterial({ color: 0xf1f5f9, roughness: 0.25 }),
+        black: new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.4 }),
+        joint: new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.3, metalness: 0.3 }),
+    };
     const buildRobot = (): THREE.Group => {
-        const group = new THREE.Group(); const s = 0.35; group.scale.set(s, s, s);
-        const torsoGrp = new THREE.Group(); torsoGrp.position.y = 2.8; group.add(torsoGrp);
-        // @ts-ignore
-        group.userData.torso = torsoGrp;
-        const chest = new THREE.Mesh(new THREE.BoxGeometry(1.4, 1.2, 0.8), ROBOT_MAT.white); chest.position.y = 0.6; torsoGrp.add(chest);
-        const abs = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.5, 0.8, 8), ROBOT_MAT.black); abs.position.y = -0.4; torsoGrp.add(abs);
-        const headGrp = new THREE.Group(); headGrp.position.y = 1.4; torsoGrp.add(headGrp);
-        // @ts-ignore
-        group.userData.head = headGrp;
-        const helmet = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.8, 0.8), ROBOT_MAT.white); headGrp.add(helmet);
+        const group = new THREE.Group();
+        const s = 0.32; group.scale.set(s, s, s);
+        const torso = new THREE.Group(); torso.position.y = 2.8; group.add(torso);
+        group.userData.torso = torso;
+        const chest = new THREE.Mesh(new THREE.BoxGeometry(1.4, 1.2, 0.8), RM.white); chest.position.y = 0.6; chest.castShadow = true; torso.add(chest);
+        const abs = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.5, 0.8, 8), RM.black); abs.position.y = -0.4; torso.add(abs);
+        const head = new THREE.Group(); head.position.y = 1.4; torso.add(head);
+        group.userData.head = head;
+        head.add(new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.8, 0.8), RM.white));
         const visorGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.6, 16, 1, false, 0, Math.PI); visorGeo.rotateZ(Math.PI / 2);
-        const visor = new THREE.Mesh(visorGeo, ROBOT_MAT.visor); visor.position.set(0, 0.05, 0.35); headGrp.add(visor);
-        const createArm = (side: 1 | -1) => { const armGrp = new THREE.Group(); armGrp.position.set(side * 0.9, 1.1, 0); torsoGrp.add(armGrp); const shoulder = new THREE.Mesh(new THREE.SphereGeometry(0.35), ROBOT_MAT.joint); armGrp.add(shoulder); const upperArm = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.15, 1.2), ROBOT_MAT.black); upperArm.position.y = -0.6; armGrp.add(upperArm); const elbow = new THREE.Mesh(new THREE.SphereGeometry(0.2), ROBOT_MAT.joint); elbow.position.y = -1.2; armGrp.add(elbow); const forearm = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.15, 1.1), ROBOT_MAT.white); forearm.position.y = -1.8; armGrp.add(forearm); const hand = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.3, 0.1), ROBOT_MAT.black); hand.position.y = -2.45; armGrp.add(hand); return armGrp; };
-        // @ts-ignore
-        group.userData.rightArm = createArm(-1); // @ts-ignore
-        group.userData.leftArm = createArm(1);
-        const hips = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.4, 0.7), ROBOT_MAT.white); hips.position.y = -0.9; torsoGrp.add(hips); const createLeg = (side: 1 | -1) => { const legGrp = new THREE.Group(); legGrp.position.set(side * 0.4, -0.9, 0); torsoGrp.add(legGrp); const thigh = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.2, 1.4), ROBOT_MAT.white); thigh.position.y = -0.7; legGrp.add(thigh); const knee = new THREE.Mesh(new THREE.SphereGeometry(0.25), ROBOT_MAT.joint); knee.position.y = -1.4; legGrp.add(knee); const shin = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.15, 1.4), ROBOT_MAT.black); shin.position.y = -2.1; legGrp.add(shin); const foot = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.15, 0.5), ROBOT_MAT.white); foot.position.set(0, -2.85, 0.1); legGrp.add(foot); return legGrp; };
-        // @ts-ignore
-        group.userData.rightLeg = createLeg(-1); // @ts-ignore
-        group.userData.leftLeg = createLeg(1);
+        const visorMat = new THREE.MeshStandardMaterial({ color: 0x06b6d4, emissive: 0x06b6d4, emissiveIntensity: 0.6, metalness: 0.8, roughness: 0.1 });
+        const visor = new THREE.Mesh(visorGeo, visorMat); visor.position.set(0, 0.05, 0.35); head.add(visor);
+        group.userData.visorMat = visorMat;
+        const mkArm = (side: 1 | -1) => {
+            const arm = new THREE.Group(); arm.position.set(side * 0.9, 1.1, 0); torso.add(arm);
+            arm.add(new THREE.Mesh(new THREE.SphereGeometry(0.32), RM.joint));
+            const ua = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 1.2), RM.black); ua.position.y = -0.6; arm.add(ua);
+            const fa = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.14, 1.1), RM.white); fa.position.y = -1.7; arm.add(fa);
+            return arm;
+        };
+        group.userData.armL = mkArm(1); group.userData.armR = mkArm(-1);
+        const hips = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.4, 0.7), RM.white); hips.position.y = -0.9; torso.add(hips);
+        const mkLeg = (side: 1 | -1) => {
+            const leg = new THREE.Group(); leg.position.set(side * 0.4, -0.9, 0); torso.add(leg);
+            const th = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.18, 1.4), RM.white); th.position.y = -0.7; leg.add(th);
+            const sh = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.13, 1.4), RM.black); sh.position.y = -2.1; leg.add(sh);
+            const ft = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.15, 0.5), RM.white); ft.position.set(0, -2.85, 0.1); leg.add(ft);
+            return leg;
+        };
+        group.userData.legL = mkLeg(1); group.userData.legR = mkLeg(-1);
+        // carried package
+        const carry = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.9, 0.9), new THREE.MeshStandardMaterial({ color: 0xc08a4d, roughness: 0.8 }));
+        carry.position.set(0, 0.4, 1.0);
+        carry.visible = false;
+        torso.add(carry);
+        group.userData.carry = carry;
+        // battery bar (sprite-like plane above head)
+        const bar = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 0.18), new THREE.MeshBasicMaterial({ color: 0x22c55e, depthTest: false }));
+        bar.position.y = 5.4;
+        group.add(bar);
+        group.userData.bar = bar;
         return group;
     };
 
-    const findPath = (start: THREE.Vector3, end: THREE.Vector3): THREE.Vector3[] | null => {
-        const offset = GRID/2; 
-        // Clamp to valid grid indices to prevent boundary errors
-        const sx = Math.max(0, Math.min(GRID - 1, Math.floor(start.x + offset))); 
-        const sz = Math.max(0, Math.min(GRID - 1, Math.floor(start.z + offset))); 
-        const ex = Math.max(0, Math.min(GRID - 1, Math.floor(end.x + offset))); 
-        const ez = Math.max(0, Math.min(GRID - 1, Math.floor(end.z + offset)));
-        
-        // Safety bounds check (Redundant with clamping but good practice)
-        if (ex < 0 || ex >= GRID || ez < 0 || ez >= GRID) return null;
-        // Check if destination is blocked
-        if (gridRef.current[ez*GRID + ex] === 1) return null; 
-
-        // BFS with 8-connectivity (allow diagonals)
-        const queue = [{x: sx, z: sz, path: [] as {x:number, z:number}[]}]; 
-        const visited = new Set<string>(); 
-        visited.add(`${sx},${sz}`);
-        
-        while(queue.length > 0) {
-            const {x, z, path} = queue.shift()!;
-            
-            // Reached target
-            if (x === ex && z === ez) {
-                const fullPath = [...path, {x, z}].map(p => new THREE.Vector3(p.x - offset + 0.5, 0, p.z - offset + 0.5));
-                // If we have a path of at least 2 steps (Start -> Next), exclude Start
-                // If path is just [Start] (already at target), returning [] is correct
-                if (fullPath.length > 1) return fullPath.slice(1);
-                return fullPath.length === 1 ? [] : fullPath;
-            }
-            
-            // 8 Directions: N, S, E, W, NE, NW, SE, SW
-            const dirs = [
-                [0,1], [0,-1], [1,0], [-1,0],
-                [1,1], [1,-1], [-1,1], [-1,-1]
-            ];
-            
-            for(let d of dirs) {
-                const nx = x + d[0]; 
-                const nz = z + d[1]; 
-                const key = `${nx},${nz}`;
-                
-                if (nx>=0 && nx<GRID && nz>=0 && nz<GRID && !visited.has(key)) {
-                    if (gridRef.current[nz*GRID + nx] === 0) { 
-                        visited.add(key); 
-                        queue.push({x: nx, z: nz, path: [...path, {x, z}]}); 
-                    }
-                }
-            }
-        }
-        return null; 
+    const spawnBot = (cell: number) => {
+        if (!sceneRef.current || bots.current.length >= 8) return false;
+        if (walls.current[cell] === 1) return false;
+        const model = buildRobot();
+        sceneRef.current.add(model);
+        const [x, z] = c2xz(cell);
+        const bot: Bot = {
+            id: stats.current.botSeq++,
+            pos: new THREE.Vector3(x, 0, z), angle: 0,
+            status: 'IDLE', path: [], pathIdx: 0,
+            battery: 70 + Math.random() * 30, task: -1, timer: 0, stuck: 0, delivered: 0,
+            model, carry: model.userData.carry,
+        };
+        bots.current.push(bot);
+        return true;
     };
 
-    const init = (scene: THREE.Scene) => {
-        if (gridRef.current.length === 0) { 
-            gridRef.current = Array(GRID*GRID).fill(0); 
-            for(let i=1; i<GRID*GRID; i++) { 
-                if(Math.random() < settings.mapComplexity/100) gridRef.current[i] = 1; 
+    // ---------- init ----------
+    const init = (ctx: SimContext) => {
+        const { scene } = ctx;
+        sceneRef.current = scene;
+        bots.current = [];
+        tasks.current = [];
+        stats.current = { delivered: 0, spawnAcc: 0, metricAcc: 0, selected: -1, botSeq: 0, startTime: 0 };
+
+        // warehouse layout: shelf racks
+        const W = walls.current; W.fill(0);
+        for (let row = 3; row < GRID - 4; row += 3) {
+            for (let gx = 3; gx < GRID - 3; gx++) {
+                if (gx % 7 === 6) continue; // aisles
+                W[row * GRID + gx] = 1;
             }
         }
-        gridRef.current[0] = 0;
+        for (const c of [...DOCKS, ...CHARGERS]) W[c] = 0;
 
-        const geo = new THREE.BoxGeometry(0.9, 0.2, 0.9); const mesh = new THREE.InstancedMesh(geo, MAT.base, GRID*GRID); mesh.castShadow = true; mesh.receiveShadow = true; scene.add(mesh);
-        // @ts-ignore
-        meshRef.current = mesh;
-        const planeMat = new THREE.MeshBasicMaterial({ visible: false }); const plane = new THREE.Mesh(new THREE.PlaneGeometry(100, 100), planeMat); plane.rotation.x = -Math.PI/2; plane.visible = true; scene.add(plane);
-        // @ts-ignore
-        planeRef.current = plane;
-        const robot = buildRobot(); scene.add(robot);
-        // @ts-ignore
-        robotRef.current = robot;
-        
-        const chargerGrp = new THREE.Group();
-        const offset = GRID/2;
-        chargerGrp.position.set(-offset + 0.5, 0, -offset + 0.5);
-        
-        const cBase = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.6, 0.1, 8), new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.8, roughness: 0.2 }));
-        cBase.position.y = 0.05;
-        chargerGrp.add(cBase);
-        
-        const cCrystal = new THREE.Mesh(
-            new THREE.OctahedronGeometry(0.25), 
-            new THREE.MeshStandardMaterial({ 
-                color: 0xfacc15, 
-                emissive: 0xfacc15, 
-                emissiveIntensity: 0.8,
-                transparent: true,
-                opacity: 0.9
-            })
-        );
-        cCrystal.position.y = 0.6;
-        cCrystal.name = 'crystal';
-        chargerGrp.add(cCrystal);
-        
-        const cRing = new THREE.Mesh(new THREE.RingGeometry(0.6, 0.7, 32), new THREE.MeshBasicMaterial({ color: 0xfacc15, transparent: true, opacity: 0.5, side: THREE.DoubleSide }));
-        cRing.rotation.x = -Math.PI/2;
-        cRing.position.y = 0.02;
-        chargerGrp.add(cRing);
+        // floor
+        const fGeo = new THREE.BoxGeometry(0.96, 0.15, 0.96); fGeo.translate(0, -0.075, 0);
+        const fm = new THREE.InstancedMesh(fGeo, new THREE.MeshStandardMaterial({ roughness: 0.7 }), GRID * GRID);
+        fm.receiveShadow = true;
+        scene.add(fm);
+        floorMesh.current = fm;
 
-        scene.add(chargerGrp);
-        // @ts-ignore
-        chargerRef.current = chargerGrp;
+        // packages
+        const pGeo = new THREE.BoxGeometry(0.5, 0.5, 0.5); pGeo.translate(0, 0.25, 0);
+        const pm = new THREE.InstancedMesh(pGeo, new THREE.MeshStandardMaterial({ color: 0xc08a4d, roughness: 0.8 }), 60);
+        pm.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        pm.castShadow = true;
+        scene.add(pm);
+        pkgMesh.current = pm;
 
+        // dock pads
+        for (const d of DOCKS) {
+            const [x, z] = c2xz(d);
+            const pad = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.06, 0.9), new THREE.MeshStandardMaterial({ color: 0x10b981, emissive: 0x10b981, emissiveIntensity: 0.4 }));
+            pad.position.set(x, 0.03, z);
+            scene.add(pad);
+        }
+        // chargers
+        for (const c of CHARGERS) {
+            const [x, z] = c2xz(c);
+            const base = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.42, 0.1, 8), new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.8 }));
+            base.position.set(x, 0.05, z);
+            scene.add(base);
+            const crystal = new THREE.Mesh(new THREE.OctahedronGeometry(0.18), new THREE.MeshStandardMaterial({ color: 0xfacc15, emissive: 0xfacc15, emissiveIntensity: 0.9 }));
+            crystal.position.set(x, 0.5, z);
+            (crystal as any).userData.base = 0.5;
+            scene.add(crystal);
+            (singles.current.crystals ??= []).push(crystal);
+        }
 
-        const lineGeo = new THREE.BufferGeometry(); 
-        const lineMat = new THREE.LineBasicMaterial({ color: 0xf472b6, transparent: true, opacity: 0.6 }); 
-        const lines = new THREE.LineSegments(lineGeo, lineMat); scene.add(lines);
-        // @ts-ignore
-        lidarLinesRef.current = lines;
-        
-        // Path Visualizer
-        const pathGeo = new THREE.BufferGeometry();
-        const pathMat = new THREE.LineBasicMaterial({ color: 0x06b6d4, transparent: true, opacity: 0.8 });
-        const pathLine = new THREE.Line(pathGeo, pathMat);
+        // path visualizer for selected bot
+        const pathLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x0e7490, transparent: true, opacity: 0.95 }));
         scene.add(pathLine);
-        // @ts-ignore
-        pathLinesRef.current = pathLine;
-        
-        const tGeo = new THREE.BoxGeometry(0.5, 0.5, 0.5); 
-        const tMat = new THREE.MeshBasicMaterial({ color: 0x10b981, transparent: true, opacity: 0.6 }); 
-        const target = new THREE.Mesh(tGeo, tMat); target.visible = false; scene.add(target);
-        // @ts-ignore
-        targetRef.current = target;
-        
-        const cur = new THREE.Mesh(new THREE.BoxGeometry(1, 0.5, 1), MAT.hover); cur.visible = false; scene.add(cur);
-        // @ts-ignore
-        cursorRef.current = cur;
-        const cmGeo = new THREE.RingGeometry(0.3, 0.4, 16); const cmMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, side: THREE.DoubleSide }); const cm = new THREE.Mesh(cmGeo, cmMat); cm.rotation.x = -Math.PI/2; cm.position.y = 0.6; scene.add(cm);
-        // @ts-ignore
-        clickMarkerRef.current = cm;
+        singles.current.pathLine = pathLine;
+
+        // lidar
+        const lidar = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xdb2777, transparent: true, opacity: 0.55 }));
+        scene.add(lidar);
+        singles.current.lidar = lidar;
+
+        // cursor + plane
+        const cur = new THREE.Mesh(new THREE.BoxGeometry(1, 0.6, 1), new THREE.MeshBasicMaterial({ color: 0x22d3ee, wireframe: true, transparent: true, opacity: 0.6 }));
+        cur.visible = false; scene.add(cur);
+        singles.current.cursor = cur;
+        const plane = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshBasicMaterial({ visible: false }));
+        plane.rotation.x = -Math.PI / 2; scene.add(plane);
+        singles.current.plane = plane;
+
+        // initial fleet + tasks
+        spawnBot(2 * GRID + 5);
+        spawnBot(2 * GRID + 12);
+        spawnBot(7 * GRID + 8);
+        for (let i = 0; i < 4; i++) spawnTask();
+
+        ctx.lights.hemi.intensity = 0.85;
     };
 
-    const animate = (scene: THREE.Scene, camera: THREE.Camera, renderer: THREE.WebGLRenderer, frame: number, mouse: THREE.Vector2, raycaster: THREE.Raycaster) => {
-        if (!meshRef.current || !robotRef.current) return;
-        const mesh = meshRef.current; const robot = robotRef.current; const state = stateRef.current; const dummy = new THREE.Object3D(); const color = new THREE.Color(); const offset = GRID/2;
-        
-        // --- BATTERY & DEATH LOGIC ---
-        const drainRate = (settings.batteryDrain / 500); 
-        if (state.status === 'MOVING' || state.status === 'WORKING' || state.status === 'RETURNING') {
-            state.battery = Math.max(0, state.battery - drainRate);
+    const spawnTask = () => {
+        if (tasks.current.length >= 40) return;
+        const W = walls.current;
+        // spawn adjacent to a shelf
+        for (let tries = 0; tries < 40; tries++) {
+            const i = Math.floor(Math.random() * GRID * GRID);
+            if (W[i] === 1 || DOCKS.includes(i) || CHARGERS.includes(i)) continue;
+            const gx = i % GRID, gz = Math.floor(i / GRID);
+            const nearShelf = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dz]) => {
+                const nx = gx + dx, nz = gz + dz;
+                return nx >= 0 && nx < GRID && nz >= 0 && nz < GRID && W[nz * GRID + nx] === 1;
+            });
+            if (!nearShelf) continue;
+            if (tasks.current.some(t => t.cell === i)) continue;
+            tasks.current.push({ cell: i, claimed: -1 });
+            return;
+        }
+    };
+
+    // ---------- FSM ----------
+    const setPath = (b: Bot, target: number): boolean => {
+        const occupied = new Set<number>();
+        for (const o of bots.current) if (o !== b) occupied.add(xz2c(o.pos.x, o.pos.z));
+        const from = xz2c(b.pos.x, b.pos.z);
+        if (from < 0) return false;
+        const p = astar(from, target, occupied);
+        if (!p) {
+            const p2 = astar(from, target); // ignore robots
+            if (!p2) return false;
+            b.path = p2;
+        } else b.path = p;
+        b.pathIdx = 0;
+        return true;
+    };
+
+    const stepBot = (b: Bot, i: number, dt: number, ctx: SimContext) => {
+        const s = settingsRef.current;
+        const speed = Math.max(0.5, (s.robotSpeed ?? 45) / 22);
+        const drain = (s.batteryDrain ?? 20) / 100;
+
+        const moving = b.status === 'TO_PICKUP' || b.status === 'TO_DOCK' || b.status === 'TO_CHARGER';
+        if (moving || b.status === 'PICKING' || b.status === 'DROPPING') b.battery = Math.max(0, b.battery - drain * dt * (moving ? 2.2 : 1.2));
+
+        // low battery override
+        if (b.battery < 18 && b.status !== 'TO_CHARGER' && b.status !== 'CHARGING') {
+            if (b.task >= 0 && tasks.current[b.task]) tasks.current[b.task].claimed = -1;
+            b.task = -1; b.carry.visible = false;
+            const free = CHARGERS.filter(c => !bots.current.some(o => o !== b && xz2c(o.pos.x, o.pos.z) === c));
+            const target = free[0] ?? CHARGERS[b.id % CHARGERS.length];
+            if (setPath(b, target)) { b.status = 'TO_CHARGER'; cbRef.current.onEvent?.(`Unit-${b.id + 1} battery low (${Math.round(b.battery)}%) — heading to charger.`, 'warning'); }
+            else b.status = 'STUCK';
         }
 
-        if (state.battery <= 0 && state.status !== 'CHARGING') {
-            state.status = 'DEAD';
-            state.battery = 0;
-            if (!isDeadRef.current) { isDeadRef.current = true; setIsDead(true); }
-        }
-
-        if (state.status !== 'DEAD' && state.battery < 10 && !state.isGoingToCharge && state.status !== 'CHARGING') {
-             const chargerPos = new THREE.Vector3(-offset + 0.5, 0, -offset + 0.5);
-             const path = findPath(state.pos, chargerPos);
-             if (path) {
-                 state.isGoingToCharge = true; state.status = 'RETURNING'; state.target.copy(chargerPos); state.path = path; state.pathIdx = 0;
-                 if (targetRef.current) targetRef.current.visible = false;
-             } else {
-                 state.status = 'BLOCKED';
-             }
-        }
-
-        // Render Cursor
-        if (clickMarkerRef.current) { const mat = clickMarkerRef.current.material as THREE.MeshBasicMaterial; if (mat.opacity > 0) { mat.opacity -= 0.05; clickMarkerRef.current.scale.multiplyScalar(1.05); } else { clickMarkerRef.current.visible = false; } }
-        raycaster.setFromCamera(mouse, camera); let cx = 0, cz = 0, hoverIdx = -1;
-        if (planeRef.current) { const ints = raycaster.intersectObject(planeRef.current); if (ints.length > 0) { const pt = ints[0].point; const gx = Math.floor(pt.x + offset); const gz = Math.floor(pt.z + offset); if (gx >= 0 && gx < GRID && gz >= 0 && gz < GRID) { hoverIdx = gz * GRID + gx; cx = gx - offset + 0.5; cz = gz - offset + 0.5; } } }
-        if (cursorRef.current) { if (hoverIdx !== -1) { cursorRef.current.position.set(cx, 0.5, cz); cursorRef.current.visible = true; const curMat = cursorRef.current.material as THREE.MeshBasicMaterial; const tool = activeToolRef.current; if (tool === 'wall') curMat.color.setHex(0x334155); else if (tool === 'target') curMat.color.setHex(0x10b981); else if (tool === 'clear') curMat.color.setHex(0xe2e8f0); else curMat.color.setHex(0xffffff); } else { cursorRef.current.visible = false; } }
-        if (onHover && frame % 5 === 0) { if (hoverIdx !== -1) { const isWall = gridRef.current[hoverIdx] === 1; const isTarget = Math.abs(state.target.x - cx) < 0.1 && Math.abs(state.target.z - cz) < 0.1; const isCharger = hoverIdx === 0; onHover({ x: mouse.x, y: mouse.y, visible: true, label: isCharger ? 'Charging Station' : (isTarget ? 'Target Goal' : (isWall ? 'Obstacle' : 'Empty Space')), data: [`Pos: [${Math.floor(cx+offset)}, ${Math.floor(cz+offset)}]`] }); } else { onHover({x:0, y:0, visible: false, label: ''}); } }
-        
-        // Render Floor
-        for(let i=0; i<GRID*GRID; i++) { 
-            const x = (i % GRID) - offset + 0.5; const z = Math.floor(i / GRID) - offset + 0.5; 
-            dummy.position.set(x, 0, z); const isWall = gridRef.current[i] === 1; 
-            dummy.scale.y = isWall ? 5 : 1; dummy.position.y = isWall ? 0.5 : 0; 
-            if (isWall) {
-                const seed = Math.abs(Math.sin(i * 12.9898) * 43758.5453); const variant = Math.floor((seed * 100) % 6);
-                switch(variant) { case 0: color.setHex(0x8b4513); break; case 1: color.setHex(0xa0522d); break; case 2: color.setHex(0xcd853f); break; case 3: color.setHex(0xd2b48c); break; case 4: color.setHex(0xbc8f8f); break; case 5: color.setHex(0x654321); break; default: color.setHex(0x8b4513); }
-            } else { const isCheck = (Math.floor(x+offset) + Math.floor(z+offset)) % 2 === 0; color.setHex(isCheck ? 0xf8fafc : 0xe2e8f0); }
-            dummy.updateMatrix(); mesh.setMatrixAt(i, dummy.matrix); mesh.setColorAt(i, color); 
-        } 
-        mesh.instanceMatrix.needsUpdate = true; if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-        
-        // Update Charger
-        if (chargerRef.current) {
-             const crystal = chargerRef.current.getObjectByName('crystal');
-             if (crystal) {
-                 crystal.rotation.y += 0.05; crystal.position.y = 0.6 + Math.sin(frame * 0.1) * 0.1;
-                 if (state.status === 'CHARGING') { (crystal.material as THREE.MeshStandardMaterial).emissiveIntensity = 1 + Math.sin(frame * 0.5) * 0.5; } else { (crystal.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.5; }
-             }
-        }
-
-        // --- STATE MACHINE ---
-        if (state.status !== 'DEAD') {
-            if (state.status === 'IDLE' && autoTaskTimer.current > -1000) { 
-                autoTaskTimer.current++; 
-                if (autoTaskTimer.current > 60) { 
-                    let tx = 0, tz = 0, found = false; 
-                    for(let k=0; k<20; k++){ 
-                        tx = Math.floor(Math.random()*GRID) - offset + 0.5; tz = Math.floor(Math.random()*GRID) - offset + 0.5; 
-                        const idx = (Math.floor(tz + offset - 0.5) * GRID) + Math.floor(tx + offset - 0.5); 
-                        if (gridRef.current[idx] === 0 && idx !== 0) { found = true; break; } 
-                    } 
-                    if (found) { 
-                        const target = new THREE.Vector3(tx, 0, tz); const path = findPath(state.pos, target);
-                        if (path) { state.target.copy(target); state.path = path; state.pathIdx = 0; state.status = 'MOVING'; }
-                    } 
-                    autoTaskTimer.current = 0; 
-                } 
-            }
-            
-            if (state.status === 'MOVING' || state.status === 'RETURNING') { 
-                const currentTarget = state.path[state.pathIdx] || state.target;
-                const ctx = Math.floor(currentTarget.x + offset); const ctz = Math.floor(currentTarget.z + offset);
-                
-                // Blocked check
-                const isBlocked = (ctx >= 0 && ctx < GRID && ctz >= 0 && ctz < GRID && gridRef.current[ctz*GRID + ctx] === 1);
-                
-                if (isBlocked) {
-                    const newPath = findPath(state.pos, state.target);
-                    if (newPath) { state.path = newPath; state.pathIdx = 0; } 
-                    else { state.status = 'BLOCKED'; state.blockedRetries = 0; }
-                } else {
-                    const dx = currentTarget.x - state.pos.x; const dz = currentTarget.z - state.pos.z; const dist = Math.sqrt(dx*dx + dz*dz); 
-                    const moveSpeed = settings.robotSpeed / 300; 
-                    if (dist < 0.15) { 
-                        state.pathIdx++; 
-                        if (state.pathIdx >= state.path.length) { 
-                            if (state.isGoingToCharge) { state.status = 'CHARGING'; } 
-                            else { state.status = 'WORKING'; state.workTimer = 0; }
-                        } 
-                    } else { 
-                        const targetAngle = Math.atan2(dx, dz); let angleDiff = targetAngle - state.angle; 
-                        while (angleDiff > Math.PI) angleDiff -= Math.PI*2; while (angleDiff < -Math.PI) angleDiff += Math.PI*2; 
-                        state.angle += angleDiff * 0.15; 
-                        const isTurning = Math.abs(angleDiff) > 0.3; const currentSpeed = isTurning ? 0 : moveSpeed; 
-                        state.pos.x += Math.sin(state.angle) * currentSpeed; state.pos.z += Math.cos(state.angle) * currentSpeed; 
-                    } 
+        switch (b.status) {
+            case 'IDLE': {
+                b.timer += dt;
+                if (b.timer < 0.4) break;
+                b.timer = 0;
+                // claim nearest unclaimed task
+                let best = -1, bestD = Infinity;
+                for (let t = 0; t < tasks.current.length; t++) {
+                    const task = tasks.current[t];
+                    if (task.claimed >= 0) continue;
+                    const [tx, tz] = c2xz(task.cell);
+                    const d = Math.abs(tx - b.pos.x) + Math.abs(tz - b.pos.z);
+                    if (d < bestD) { bestD = d; best = t; }
                 }
-            } 
-            else if (state.status === 'BLOCKED') { 
-                // Nudge towards center of tile to fix edge cases
-                const tileCenter = new THREE.Vector3(
-                    Math.floor(state.pos.x + offset) - offset + 0.5,
-                    0,
-                    Math.floor(state.pos.z + offset) - offset + 0.5
-                );
-                state.pos.lerp(tileCenter, 0.1);
-                
-                state.workTimer++; 
-                if (state.workTimer > 30) { 
-                    state.workTimer = 0; state.blockedRetries++;
-                    const path = findPath(state.pos, state.target);
-                    if (path) { state.path = path; state.pathIdx = 0; state.status = state.isGoingToCharge ? 'RETURNING' : 'MOVING'; } 
-                    else {
-                        // If manually blocked or stuck too long, reset to IDLE immediately to allow new tasks or user correction
-                        if (state.blockedRetries > 3 || !state.isGoingToCharge) { state.status = 'IDLE'; autoTaskTimer.current = 0; }
+                if (best >= 0 && setPath(b, tasks.current[best].cell)) {
+                    tasks.current[best].claimed = b.id;
+                    b.task = best;
+                    b.status = 'TO_PICKUP';
+                }
+                break;
+            }
+            case 'TO_PICKUP': case 'TO_DOCK': case 'TO_CHARGER': {
+                if (b.pathIdx >= b.path.length) {
+                    if (b.status === 'TO_PICKUP') { b.status = 'PICKING'; b.timer = 0; }
+                    else if (b.status === 'TO_DOCK') { b.status = 'DROPPING'; b.timer = 0; }
+                    else { b.status = 'CHARGING'; }
+                    break;
+                }
+                const nextCell = b.path[b.pathIdx];
+                // dynamic obstacle: another robot on next cell → wait, then replan
+                const occupiedBy = bots.current.find(o => o !== b && xz2c(o.pos.x, o.pos.z) === nextCell);
+                if (occupiedBy) {
+                    b.stuck += dt;
+                    if (b.stuck > 1.2) {
+                        b.stuck = 0;
+                        const goal = b.path[b.path.length - 1];
+                        setPath(b, goal);
                     }
-                } 
-            } 
-            else if (state.status === 'WORKING') { 
-                state.workTimer++; 
-                if (state.workTimer > 60) { state.status = 'IDLE'; autoTaskTimer.current = 0; if (targetRef.current) targetRef.current.visible = false; } 
-            }
-            else if (state.status === 'CHARGING') {
-                state.battery = Math.min(100, state.battery + 1.5); 
-                if (state.battery >= 100) { state.status = 'IDLE'; state.isGoingToCharge = false; state.battery = 100; autoTaskTimer.current = 0; }
-            }
-        }
-
-        // Update Path Visualization
-        if (pathLinesRef.current) {
-            if (state.status === 'MOVING' || state.status === 'RETURNING') {
-                const pts = [state.pos.clone()];
-                // Add remaining path points
-                for(let i=state.pathIdx; i<state.path.length; i++) {
-                    pts.push(state.path[i].clone());
+                    break;
                 }
-                // Raise slightly above floor
-                pts.forEach(p => p.y = 0.05);
-                pathLinesRef.current.geometry.setFromPoints(pts);
-                pathLinesRef.current.visible = true;
-            } else {
-                pathLinesRef.current.visible = false;
+                b.stuck = 0;
+                const [nx, nz] = c2xz(nextCell);
+                const dx = nx - b.pos.x, dz = nz - b.pos.z;
+                const dist = Math.hypot(dx, dz);
+                const targetAngle = Math.atan2(dx, dz);
+                let ad = targetAngle - b.angle;
+                while (ad > Math.PI) ad -= Math.PI * 2;
+                while (ad < -Math.PI) ad += Math.PI * 2;
+                b.angle += ad * Math.min(1, dt * 10);
+                const eff = Math.abs(ad) > 0.5 ? 0 : speed;
+                if (dist < 0.12) b.pathIdx++;
+                else {
+                    b.pos.x += Math.sin(b.angle) * eff * dt;
+                    b.pos.z += Math.cos(b.angle) * eff * dt;
+                }
+                break;
+            }
+            case 'PICKING': {
+                b.timer += dt;
+                if (b.timer > 1.1) {
+                    // grab package
+                    if (b.task >= 0 && tasks.current[b.task]) {
+                        tasks.current.splice(b.task, 1);
+                        // reindex claims
+                        for (const o of bots.current) if (o.task > b.task) o.task--;
+                        b.task = -1;
+                    }
+                    b.carry.visible = true;
+                    const dock = DOCKS[Math.floor(Math.random() * DOCKS.length)];
+                    if (setPath(b, dock)) b.status = 'TO_DOCK';
+                    else b.status = 'STUCK';
+                }
+                break;
+            }
+            case 'DROPPING': {
+                b.timer += dt;
+                if (b.timer > 0.9) {
+                    b.carry.visible = false;
+                    b.delivered++;
+                    stats.current.delivered++;
+                    if (stats.current.delivered % 10 === 0) cbRef.current.onEvent?.(`Fleet milestone: ${stats.current.delivered} packages dispatched! 📦`, 'good');
+                    b.status = 'IDLE'; b.timer = 0;
+                }
+                break;
+            }
+            case 'CHARGING': {
+                b.battery = Math.min(100, b.battery + dt * 14);
+                if (b.battery >= 96) { b.status = 'IDLE'; b.timer = 0; }
+                break;
+            }
+            case 'STUCK': {
+                b.timer += dt;
+                if (b.timer > 2) { b.timer = 0; b.status = 'IDLE'; }
+                break;
             }
         }
 
-        robot.position.copy(state.pos); robot.rotation.y = state.angle;
-        // @ts-ignore
-        const leftArm = robot.userData.leftArm; const rightArm = robot.userData.rightArm; const leftLeg = robot.userData.leftLeg; const rightLeg = robot.userData.rightLeg; const torso = robot.userData.torso; const head = robot.userData.head; const visor = head.children[1]; const visorMat = visor.material;
-        if (state.status === 'BLOCKED') visorMat.emissive.setHex(frame % 10 < 5 ? 0xff0000 : 0x000000); 
-        else if (state.status === 'WORKING') visorMat.emissive.setHex(0x10b981); 
-        else if (state.status === 'CHARGING') visorMat.emissive.setHex(0xfacc15);
-        else if (state.status === 'RETURNING') visorMat.emissive.setHex(0xf59e0b); 
-        else if (state.status === 'DEAD') visorMat.emissive.setHex(0x000000); 
-        else visorMat.emissive.setHex(0x06b6d4);
-
-        // Robot Animation
-        if (state.status === 'DEAD') {
-            leftArm.rotation.x = THREE.MathUtils.lerp(leftArm.rotation.x, 0, 0.1); rightArm.rotation.x = THREE.MathUtils.lerp(rightArm.rotation.x, 0, 0.1); leftArm.rotation.z = THREE.MathUtils.lerp(leftArm.rotation.z, 0.1, 0.1); rightArm.rotation.z = THREE.MathUtils.lerp(rightArm.rotation.z, -0.1, 0.1); torso.rotation.x = THREE.MathUtils.lerp(torso.rotation.x, 0.4, 0.1); head.rotation.x = THREE.MathUtils.lerp(head.rotation.x, 0.5, 0.1); robot.position.y = 0;
+        // ---- animation ----
+        const m = b.model;
+        m.position.set(b.pos.x, m.position.y, b.pos.z);
+        m.rotation.y = b.angle;
+        const { armL, armR, legL, legR, torso, head, visorMat, bar } = m.userData;
+        const f = ctx.time * 9 + i * 2;
+        if (moving && b.pathIdx < b.path.length) {
+            const sw = Math.sin(f);
+            armL.rotation.x = sw * 0.6; armR.rotation.x = -sw * 0.6;
+            legL.rotation.x = -sw * 0.7; legR.rotation.x = sw * 0.7;
+            m.position.y = Math.abs(Math.cos(f)) * 0.05;
+            torso.rotation.x = 0.08;
+        } else if (b.status === 'PICKING' || b.status === 'DROPPING') {
+            const pr = Math.min(1, b.timer / 0.9);
+            const squat = Math.sin(pr * Math.PI);
+            m.position.y = -squat * 0.22;
+            torso.rotation.x = squat * 0.5;
+            armL.rotation.x = -squat * 1.4; armR.rotation.x = -squat * 1.4;
+        } else {
+            const breath = Math.sin(ctx.wallTime * 2 + i) * 0.04;
+            armL.rotation.x *= 0.9; armR.rotation.x *= 0.9;
+            legL.rotation.x *= 0.9; legR.rotation.x *= 0.9;
+            torso.rotation.x = breath * 0.5;
+            m.position.y = 0;
         }
-        else if (state.status === 'MOVING' || state.status === 'RETURNING') { 
-            const speed = 0.3; const swing = Math.sin(frame * speed); leftArm.rotation.x = swing * 0.6; rightArm.rotation.x = -swing * 0.6; leftLeg.rotation.x = -swing * 0.8; rightLeg.rotation.x = swing * 0.8; leftLeg.children[1].rotation.x = swing > 0 ? swing * 0.5 : 0; rightLeg.children[1].rotation.x = swing < 0 ? -swing * 0.5 : 0; robot.position.y = Math.abs(Math.cos(frame * speed * 2)) * 0.08; torso.rotation.x = 0.1; head.rotation.y = Math.sin(frame * 0.05) * 0.2; 
-        } else if (state.status === 'WORKING') { 
-            const progress = Math.min(1, state.workTimer / 30); const squat = Math.sin(progress * Math.PI); robot.position.y = -squat * 0.3; torso.rotation.x = squat * 0.5; leftArm.rotation.x = -squat * 1.5; rightArm.rotation.x = -squat * 1.5; head.rotation.y = Math.sin(frame * 0.5); 
-        } else if (state.status === 'CHARGING') {
-            robot.position.y = 0; head.rotation.x = -0.5; leftArm.rotation.z = 0.5; rightArm.rotation.z = -0.5; robot.position.y = Math.sin(frame * 0.2) * 0.05;
-        } else { 
-            const breath = Math.sin(frame * 0.05) * 0.05; leftArm.rotation.x = THREE.MathUtils.lerp(leftArm.rotation.x, 0, 0.1); rightArm.rotation.x = THREE.MathUtils.lerp(rightArm.rotation.x, 0, 0.1); leftLeg.rotation.x = THREE.MathUtils.lerp(leftLeg.rotation.x, 0, 0.1); rightLeg.rotation.x = THREE.MathUtils.lerp(rightLeg.rotation.x, 0, 0.1); leftLeg.children[1].rotation.x = 0; rightLeg.children[1].rotation.x = 0; torso.rotation.x = 0; leftArm.rotation.z = 0.1 + breath * 0.1; rightArm.rotation.z = -0.1 - breath * 0.1; robot.position.y = 0; head.rotation.y = Math.sin(frame * 0.02) * 0.5; head.rotation.x = 0; 
-        }
-        
-        const rays = 32; const linePos: number[] = []; const range = settings.sensorRange || 5; const headPos = state.pos.clone().add(new THREE.Vector3(0, 1.4, 0)); 
-        if (state.status !== 'CHARGING' && state.status !== 'DEAD') {
-            for(let i=0; i<rays; i++) { const angle = (i / rays) * Math.PI * 2 + frame * 0.05 + state.angle + head.rotation.y; const dir = new THREE.Vector3(Math.sin(angle), 0, Math.cos(angle)); let hitDist = range; for(let d=0.5; d<range; d+=0.5) { const checkX = state.pos.x + dir.x * d; const checkZ = state.pos.z + dir.z * d; const gx = Math.floor(checkX + offset); const gz = Math.floor(checkZ + offset); if (gx>=0 && gx<GRID && gz>=0 && gz<GRID) { if (gridRef.current[gz*GRID + gx] === 1) { hitDist = d; break; } } } if (Math.random()*50 < settings.sensorNoise) hitDist *= (0.8 + Math.random()*0.4); const end = headPos.clone().add(dir.multiplyScalar(hitDist)); end.y = Math.max(0, end.y - hitDist * 0.2); linePos.push(headPos.x, headPos.y, headPos.z); linePos.push(end.x, end.y, end.z); }
-        }
-        if (lidarLinesRef.current) lidarLinesRef.current.geometry.setAttribute('position', new THREE.Float32BufferAttribute(linePos, 3));
-        
-        if (targetRef.current) { 
-            if (state.status === 'CHARGING' || state.status === 'RETURNING' || state.status === 'DEAD') { targetRef.current.visible = false; }
-            else if (state.status !== 'IDLE' && (state.status === 'MOVING' || state.status === 'WORKING')) { targetRef.current.visible = true; targetRef.current.position.set(state.target.x, 0.5, state.target.z); targetRef.current.rotation.y += 0.05; } else { targetRef.current.visible = false; } 
-        }
-
-        if (frame === 1 || frame % 30 === 0) {
-             onUpdateMetrics([ 
-                 { label: 'Battery', value: state.battery.toFixed(0), unit: '%', status: state.status === 'DEAD' || state.battery < 20 ? 'critical' : 'good' }, 
-                 { label: 'Status', value: state.status, status: state.status === 'DEAD' ? 'critical' : (state.status === 'BLOCKED' || state.status === 'RETURNING' ? 'warning' : state.status === 'CHARGING' ? 'good' : 'neutral') }, 
-                 { label: 'Task', value: state.status === 'WORKING' ? 'EXECUTING' : (state.status === 'CHARGING' ? 'RECHARGING' : (state.status === 'DEAD' ? 'SYSTEM FAIL' : 'SEARCHING')), status: 'neutral' } 
-             ]);
-        }
-    };
-    const onClick = (s:THREE.Scene, c:THREE.Camera, m:THREE.Vector2, r:THREE.Raycaster) => {
-        if (stateRef.current.status === 'DEAD') return;
-        r.setFromCamera(m, c); const tool = activeToolRef.current; const offset = GRID/2; let idx = -1;
-        if (planeRef.current) { const ints = r.intersectObject(planeRef.current); if (ints.length > 0) { const pt = ints[0].point; const gx = Math.floor(pt.x + offset); const gz = Math.floor(pt.z + offset); if (gx >= 0 && gx < GRID && gz >= 0 && gz < GRID) { idx = gz * GRID + gx; } if (clickMarkerRef.current) { clickMarkerRef.current.position.set(pt.x, 0.6, pt.z); clickMarkerRef.current.scale.set(1, 1, 1); (clickMarkerRef.current.material as THREE.MeshBasicMaterial).opacity = 1.0; clickMarkerRef.current.visible = true; } } }
-        if (idx !== -1 && idx !== 0) { 
-             const x = (idx % GRID) - offset + 0.5; const z = Math.floor(idx / GRID) - offset + 0.5; 
-             if (tool === 'target') { 
-                 const tgt = new THREE.Vector3(x, 0, z); 
-                 const path = findPath(stateRef.current.pos, tgt); 
-                 if (path) {
-                    stateRef.current.target.copy(tgt); stateRef.current.path = path; stateRef.current.pathIdx = 0; stateRef.current.status = 'MOVING'; stateRef.current.workTimer = 0; autoTaskTimer.current = -99999; stateRef.current.isGoingToCharge = false; 
-                    if (targetRef.current) { targetRef.current.position.set(x, 0.5, z); targetRef.current.visible = true; } 
-                 } else { stateRef.current.status = 'BLOCKED'; }
-             } else if (tool === 'wall') { gridRef.current[idx] = 1; } else if (tool === 'clear') { gridRef.current[idx] = 0; } 
-        }
+        head.rotation.y = Math.sin(ctx.wallTime * 1.2 + i * 3) * 0.4;
+        visorMat.emissive.setHex(
+            b.status === 'CHARGING' ? 0xfacc15 :
+            b.status === 'STUCK' ? 0xef4444 :
+            b.status === 'TO_CHARGER' ? 0xf59e0b :
+            b.carry.visible ? 0x10b981 : 0x06b6d4);
+        // battery bar
+        bar.scale.x = Math.max(0.02, b.battery / 100);
+        (bar.material as THREE.MeshBasicMaterial).color.setHex(b.battery > 50 ? 0x22c55e : b.battery > 20 ? 0xeab308 : 0xef4444);
+        bar.lookAt(ctx.camera.position);
     };
 
-    const handleReboot = () => {
-        stateRef.current.battery = 100; stateRef.current.status = 'IDLE'; stateRef.current.isGoingToCharge = false; isDeadRef.current = false; setIsDead(false); autoTaskTimer.current = 0;
+    // ---------- animate ----------
+    const animate = (ctx: SimContext) => {
+        const dt = ctx.dt;
+        const s = settingsRef.current;
+        const st = stats.current;
+        if (st.startTime === 0) st.startTime = ctx.time;
+
+        // task spawner
+        st.spawnAcc += dt;
+        const interval = Math.max(0.6, 8 - (s.taskRate ?? 40) * 0.07);
+        if (st.spawnAcc > interval) { st.spawnAcc = 0; spawnTask(); }
+
+        for (let i = 0; i < bots.current.length; i++) stepBot(bots.current[i], i, dt, ctx);
+
+        // ---- floor render ----
+        const fm = floorMesh.current!;
+        const dummy = new THREE.Object3D();
+        const col = new THREE.Color();
+        const W = walls.current;
+        for (let i = 0; i < GRID * GRID; i++) {
+            const [x, z] = c2xz(i);
+            const isWall = W[i] === 1;
+            dummy.position.set(x, isWall ? 0.6 : 0, z);
+            dummy.scale.set(1, isWall ? 9 : 1, 1);
+            dummy.updateMatrix();
+            fm.setMatrixAt(i, dummy.matrix);
+            if (isWall) {
+                const seed = Math.abs(Math.sin(i * 12.9898)) % 1;
+                col.setHSL(0.08, 0.42, 0.42 + seed * 0.16);
+            } else {
+                const check = ((i % GRID) + Math.floor(i / GRID)) % 2 === 0;
+                col.setHex(check ? 0xf4f7fa : 0xe3e9f1);
+                if (DOCKS.includes(i)) col.setHex(0xbfe8d2);
+                if (CHARGERS.includes(i)) col.setHex(0xf3e3ad);
+            }
+            fm.setColorAt(i, col);
+        }
+        fm.instanceMatrix.needsUpdate = true;
+        if (fm.instanceColor) fm.instanceColor.needsUpdate = true;
+
+        // ---- packages ----
+        const pm = pkgMesh.current!;
+        let pi = 0;
+        for (const t of tasks.current) {
+            const [x, z] = c2xz(t.cell);
+            dummy.position.set(x, Math.sin(ctx.wallTime * 2 + t.cell) * 0.06 + 0.05, z);
+            dummy.rotation.set(0, ctx.wallTime * 0.8 + t.cell, 0);
+            dummy.scale.setScalar(1);
+            dummy.updateMatrix();
+            if (pi < 60) pm.setMatrixAt(pi++, dummy.matrix);
+        }
+        dummy.position.set(0, -500, 0); dummy.scale.setScalar(0); dummy.updateMatrix();
+        for (let i = pi; i < 60; i++) pm.setMatrixAt(i, dummy.matrix);
+        pm.instanceMatrix.needsUpdate = true;
+
+        // ---- chargers glow ----
+        for (const c of singles.current.crystals ?? []) {
+            c.rotation.y += dt * 2;
+            c.position.y = c.userData.base + Math.sin(ctx.wallTime * 3) * 0.08;
+        }
+
+        // ---- selected bot: path + lidar ----
+        const sel = bots.current.find(b => b.id === st.selected);
+        const pathLine = singles.current.pathLine as THREE.Line;
+        const lidar = singles.current.lidar as THREE.LineSegments;
+        if (sel && sel.path.length && sel.pathIdx < sel.path.length) {
+            const pts = [sel.pos.clone().setY(0.08)];
+            for (let k = sel.pathIdx; k < sel.path.length; k++) {
+                const [x, z] = c2xz(sel.path[k]);
+                pts.push(new THREE.Vector3(x, 0.08, z));
+            }
+            pathLine.geometry.setFromPoints(pts);
+            pathLine.visible = true;
+        } else pathLine.visible = false;
+
+        if (sel) {
+            const rays = 28, range = 5;
+            const lp: number[] = [];
+            const hp = sel.pos.clone().add(new THREE.Vector3(0, 1.35, 0));
+            for (let r = 0; r < rays; r++) {
+                const a = (r / rays) * Math.PI * 2 + ctx.wallTime * 1.5;
+                const dir = new THREE.Vector3(Math.sin(a), 0, Math.cos(a));
+                let hit = range;
+                for (let d = 0.4; d < range; d += 0.4) {
+                    const ci = xz2c(sel.pos.x + dir.x * d, sel.pos.z + dir.z * d);
+                    if (ci < 0 || W[ci] === 1) { hit = d; break; }
+                }
+                const end = hp.clone().addScaledVector(dir, hit);
+                end.y = Math.max(0.05, end.y - hit * 0.25);
+                lp.push(hp.x, hp.y, hp.z, end.x, end.y, end.z);
+            }
+            lidar.geometry.setAttribute('position', new THREE.Float32BufferAttribute(lp, 3));
+            lidar.visible = true;
+        } else lidar.visible = false;
+
+        // ---- cursor / hover ----
+        const ints = ctx.raycaster.intersectObject(singles.current.plane);
+        const cursor = singles.current.cursor as THREE.Mesh;
+        let hoverCell = -1;
+        if (ints.length) hoverCell = xz2c(ints[0].point.x, ints[0].point.z);
+        if (hoverCell >= 0 && toolRef.current && toolRef.current !== 'select') {
+            const [x, z] = c2xz(hoverCell);
+            cursor.position.set(x, 0.3, z);
+            cursor.visible = true;
+            (cursor.material as THREE.MeshBasicMaterial).color.setHex(
+                toolRef.current === 'wall' ? 0xb45309 : toolRef.current === 'erase' ? 0xe2e8f0 :
+                toolRef.current === 'package' ? 0xc08a4d : toolRef.current === 'addBot' ? 0x22d3ee : 0x22d3ee);
+        } else cursor.visible = false;
+
+        if (cbRef.current.onHover && Math.floor(ctx.wallTime * 10) % 2 === 0) {
+            // hover robot?
+            let hovBot: Bot | null = null;
+            if (ints.length) {
+                for (const b of bots.current) {
+                    if (Math.hypot(b.pos.x - ints[0].point.x, b.pos.z - ints[0].point.z) < 0.8) { hovBot = b; break; }
+                }
+            }
+            if (hovBot) {
+                cbRef.current.onHover({
+                    x: ctx.mouse.x, y: ctx.mouse.y, visible: true,
+                    label: `Unit-${hovBot.id + 1}`,
+                    data: [`Status: ${hovBot.status}`, `Battery: ${Math.round(hovBot.battery)}%`, `Delivered: ${hovBot.delivered}`, 'Click to select'],
+                });
+            } else if (hoverCell >= 0) {
+                const isWall = W[hoverCell] === 1;
+                const isDock = DOCKS.includes(hoverCell);
+                const isCharger = CHARGERS.includes(hoverCell);
+                const hasPkg = tasks.current.some(t => t.cell === hoverCell);
+                cbRef.current.onHover({
+                    x: ctx.mouse.x, y: ctx.mouse.y, visible: true,
+                    label: isDock ? 'Dispatch Dock' : isCharger ? 'Charging Pad' : isWall ? 'Shelf Rack' : hasPkg ? 'Package (task)' : 'Open Floor',
+                    data: [],
+                });
+            } else cbRef.current.onHover({ x: 0, y: 0, visible: false, label: '' });
+        }
+
+        // ---- metrics ----
+        st.metricAcc += dt || 0.016;
+        if (st.metricAcc > 0.5) {
+            st.metricAcc = 0;
+            const fleet = bots.current;
+            const avgBatt = fleet.length ? fleet.reduce((a, b) => a + b.battery, 0) / fleet.length : 0;
+            const busy = fleet.filter(b => b.status !== 'IDLE' && b.status !== 'CHARGING' && b.status !== 'STUCK').length;
+            const util = fleet.length ? Math.round((busy / fleet.length) * 100) : 0;
+            const elapsedMin = Math.max(0.15, (ctx.time - st.startTime) / 60);
+            cbRef.current.onUpdateMetrics([
+                { label: 'Fleet', value: fleet.length, status: 'neutral' },
+                { label: 'Delivered', value: st.delivered, status: 'good', historyKey: 'delivered' },
+                { label: 'Rate', value: (st.delivered / elapsedMin).toFixed(1), unit: '/min', status: 'neutral', historyKey: 'rate' },
+                { label: 'Queue', value: tasks.current.length, status: tasks.current.length > 20 ? 'warning' : 'neutral' },
+                { label: 'Utilization', value: util, unit: '%', status: util > 70 ? 'good' : 'neutral' },
+                { label: 'Avg Battery', value: Math.round(avgBatt), unit: '%', status: avgBatt < 25 ? 'critical' : avgBatt < 45 ? 'warning' : 'good' },
+            ], { delivered: st.delivered, rate: Math.round((st.delivered / elapsedMin) * 10) / 10 });
+        }
     };
 
-    const mount = useThreeSim(init, animate, onClick, active, zoom);
-    
-    return (
-        <div className="relative w-full h-full">
-            <div ref={mount} className="w-full h-full" />
-            
-            {isDead && (
-                <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm animate-in fade-in duration-300">
-                    <div className="bg-slate-950 border border-red-500/50 p-8 rounded-2xl shadow-2xl flex flex-col items-center text-center max-w-sm mx-4 relative overflow-hidden">
-                        <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-red-500 to-transparent"></div>
-                        <div className="w-16 h-16 bg-red-500/10 rounded-full flex items-center justify-center mb-6 ring-1 ring-red-500/40 animate-pulse">
-                            <BatteryWarning className="text-red-500 w-8 h-8" />
-                        </div>
-                        <h2 className="text-2xl font-bold text-red-500 tracking-widest mb-2">SYSTEM FAILURE</h2>
-                        <p className="text-slate-400 text-sm mb-8 leading-relaxed">
-                            Critical power loss detected. Autonomous core has shut down to prevent hardware damage.
-                        </p>
-                        <button onClick={handleReboot} className="group relative px-6 py-3 bg-red-600 hover:bg-red-500 text-white font-bold tracking-wider uppercase text-xs rounded-lg transition-all duration-200 shadow-[0_0_20px_rgba(220,38,38,0.4)] hover:shadow-[0_0_30px_rgba(220,38,38,0.6)] flex items-center gap-3">
-                            <RotateCcw size={16} className="group-hover:rotate-180 transition-transform duration-500" />
-                            Reboot System
-                        </button>
-                    </div>
-                </div>
-            )}
-        </div>
-    );
+    // ---------- interaction ----------
+    const onClick = (ctx: SimContext) => {
+        const ints = ctx.raycaster.intersectObject(singles.current.plane);
+        if (!ints.length) return;
+        const pt = ints[0].point;
+        const cell = xz2c(pt.x, pt.z);
+        if (cell < 0) return;
+        const tool = toolRef.current;
+        const W = walls.current;
+
+        if (tool === 'select' || !tool) {
+            for (const b of bots.current) {
+                if (Math.hypot(b.pos.x - pt.x, b.pos.z - pt.z) < 0.9) {
+                    stats.current.selected = stats.current.selected === b.id ? -1 : b.id;
+                    cbRef.current.onEvent?.(stats.current.selected >= 0 ? `Unit-${b.id + 1} selected — path & LiDAR shown.` : 'Selection cleared.', 'info');
+                    return;
+                }
+            }
+            stats.current.selected = -1;
+            return;
+        }
+        if (tool === 'wall') { if (!DOCKS.includes(cell) && !CHARGERS.includes(cell)) { W[cell] = 1; tasks.current = tasks.current.filter(t => t.cell !== cell); } return; }
+        if (tool === 'erase') { W[cell] = 0; return; }
+        if (tool === 'package') {
+            if (W[cell] === 0 && !tasks.current.some(t => t.cell === cell)) {
+                tasks.current.push({ cell, claimed: -1 });
+                cbRef.current.onEvent?.('Priority package placed on the floor.', 'info');
+            }
+            return;
+        }
+        if (tool === 'addBot') {
+            if (spawnBot(cell)) cbRef.current.onEvent?.(`New robot deployed — fleet size ${bots.current.length}.`, 'good');
+            else cbRef.current.onEvent?.('Cannot deploy: cell blocked or fleet at max (8).', 'warning');
+            return;
+        }
+        if (tool === 'removeBot') {
+            for (let i = 0; i < bots.current.length; i++) {
+                const b = bots.current[i];
+                if (Math.hypot(b.pos.x - pt.x, b.pos.z - pt.z) < 0.9) {
+                    if (b.task >= 0 && tasks.current[b.task]) tasks.current[b.task].claimed = -1;
+                    sceneRef.current?.remove(b.model);
+                    bots.current.splice(i, 1);
+                    cbRef.current.onEvent?.(`Unit-${b.id + 1} decommissioned.`, 'warning');
+                    return;
+                }
+            }
+        }
+    };
+
+    const onPaint = (ctx: SimContext) => {
+        const tool = toolRef.current;
+        if (tool !== 'wall' && tool !== 'erase') return;
+        const ints = ctx.raycaster.intersectObject(singles.current.plane);
+        if (!ints.length) return;
+        const cell = xz2c(ints[0].point.x, ints[0].point.z);
+        if (cell < 0) return;
+        if (tool === 'wall' && !DOCKS.includes(cell) && !CHARGERS.includes(cell)) { walls.current[cell] = 1; tasks.current = tasks.current.filter(t => t.cell !== cell); }
+        if (tool === 'erase') walls.current[cell] = 0;
+    };
+
+    const mount = useThreeSim({
+        init, animate, onClick, onPaint,
+        active, zoom: zoom ?? 1.6, timeScale,
+        cameraType: 'orthographic',
+        cameraPos: [30, 34, 30],
+        leftOrbits: false,
+        background: 0xe8edf5,
+    });
+
+    return <div ref={mount} className="w-full h-full" />;
 });

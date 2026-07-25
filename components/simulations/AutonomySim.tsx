@@ -1,686 +1,544 @@
-
 import React, { useRef } from 'react';
 import * as THREE from 'three';
-import { useThreeSim } from '../../hooks/useThreeSim';
+import { useThreeSim, SimContext } from '../../hooks/useThreeSim';
 import { SimProps } from '../../types';
 
-const MAT = {
-    road: new THREE.MeshStandardMaterial({ color: 0x475569, roughness: 0.5 }), // Lighter asphalt (Slate-600)
-    line: new THREE.MeshBasicMaterial({ color: 0xffffff }),
-    stopLine: new THREE.MeshBasicMaterial({ color: 0xffffff }),
-    walk: new THREE.MeshBasicMaterial({ color: 0xe2e8f0 }),
-    grass: new THREE.MeshStandardMaterial({ color: 0x86efac }), // Bright sunny grass (Green-300)
-    pole: new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.2, metalness: 0.8 }),
-};
+/**
+ * Traffic network: 3×3 grid of signalized intersections.
+ * Cars follow the Intelligent Driver Model (IDM) — real car-following physics:
+ * free-road acceleration, comfortable braking, desired time-headway (shrinks
+ * with aggression), and per-intersection signal phases with an adjustable
+ * green-wave offset and adaptive (queue-actuated) switching.
+ */
 
-export const AutonomySim: React.FC<SimProps> = React.memo(({ settings, active, zoom, onUpdateMetrics }) => {
-    // State Tracking
-    const carsRef = useRef<{
-        id: number,
-        pos: THREE.Vector3, 
-        vel: number, 
-        acc: number, 
-        dir: number, // 0=N, 1=S, 2=E, 3=W
-        axis: string, 
-        dist: number, // Distance from center (starts positive, goes negative)
-        crashed: boolean,
-        remove: boolean, // New flag for cleanup
-        braking: boolean,
-        color: THREE.Color, 
-        model: THREE.Group | null,
-        box: THREE.Box3 // For precise physics
-    }[]>([]);
-    
-    const lightsRef = useRef<'red'|'green'>('red');
-    const timerRef = useRef(0);
-    const lightMeshRef = useRef<THREE.Group>(null);
-    const carGroupRef = useRef<THREE.Group>(null);
-    const collisionCountRef = useRef(0);
-    
-    // Enhanced Particle System
-    const particlesRef = useRef<{
-        pos: THREE.Vector3, 
-        vel: THREE.Vector3, 
-        life: number, 
-        maxLife: number,
-        type: 'fire'|'smoke'|'flash'|'debris'|'shockwave',
-        scale: number,
-        rot?: THREE.Vector3 
-    }[]>([]);
-    
-    const particleMeshRef = useRef<THREE.InstancedMesh>(null); // Fire
-    const smokeMeshRef = useRef<THREE.InstancedMesh>(null);   // Smoke
-    const flashMeshRef = useRef<THREE.InstancedMesh>(null);   // Impact Flash
-    const debrisMeshRef = useRef<THREE.InstancedMesh>(null);  // Flying parts
-    const shockwaveMeshRef = useRef<THREE.InstancedMesh>(null); // Ground Ring
-    
-    // Constants
-    const LANE_OFFSET = 2.0;
-    const CAR_LENGTH = 2.2;
-    const CAR_WIDTH = 1.1;
-    const CAR_HEIGHT = 0.8;
-    const STOP_LINE = 6.0;
+const ROAD_POS = [-16, 0, 16];
+const HALF = 52;
+const LANE = 1.7;
+const CAR_LEN = 2.2;
+const STOP_GAP = 4.2;
 
-    const init = (scene: THREE.Scene) => {
-        const roadW = 8;
-        const groundSize = 100;
+interface Lane { axis: 'NS' | 'EW'; fixed: number; sign: 1 | -1; }
+const LANES: Lane[] = [];
+for (const f of ROAD_POS) {
+    LANES.push({ axis: 'NS', fixed: f, sign: 1 }, { axis: 'NS', fixed: f, sign: -1 });
+    LANES.push({ axis: 'EW', fixed: f, sign: 1 }, { axis: 'EW', fixed: f, sign: -1 });
+}
 
-        // Environment
-        const ground = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), MAT.grass); 
-        ground.rotation.x = -Math.PI/2; ground.position.y = -0.15; ground.receiveShadow = true; scene.add(ground);
-        
-        // Roads
-        const roadH = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, roadW), MAT.road); roadH.rotation.x = -Math.PI/2; roadH.receiveShadow = true; scene.add(roadH);
-        const roadV = new THREE.Mesh(new THREE.PlaneGeometry(roadW, groundSize), MAT.road); roadV.rotation.x = -Math.PI/2; roadV.position.y = 0.01; roadV.receiveShadow = true; scene.add(roadV);
-        
-        // Markings
-        const markings = new THREE.Group();
-        // Center Lines (Dashed)
-        const dashGeo = new THREE.PlaneGeometry(1, 0.15);
-        for(let i=10; i<45; i+=2) {
-             const d1 = new THREE.Mesh(dashGeo, MAT.line); d1.rotation.x = -Math.PI/2; d1.position.set(i, 0.02, 0); markings.add(d1);
-             const d2 = new THREE.Mesh(dashGeo, MAT.line); d2.rotation.x = -Math.PI/2; d2.position.set(-i, 0.02, 0); markings.add(d2);
-             const d3 = new THREE.Mesh(dashGeo, MAT.line); d3.rotation.x = -Math.PI/2; d3.rotation.z = Math.PI/2; d3.position.set(0, 0.02, i); markings.add(d3);
-             const d4 = new THREE.Mesh(dashGeo, MAT.line); d4.rotation.x = -Math.PI/2; d4.rotation.z = Math.PI/2; d4.position.set(0, 0.02, -i); markings.add(d4);
+type VType = 'car' | 'truck' | 'sport';
+interface Car {
+    lane: Lane;
+    u: number;         // position along travel direction (-HALF..HALF)
+    v: number;         // speed units/s
+    crashed: boolean;
+    wreckTimer: number;
+    braking: boolean;
+    waiting: number;   // seconds spent at ~0 speed
+    totalWait: number;
+    hue: number;
+    type: VType;
+    len: number;       // body length (trucks are longer)
+    vf: number;        // desired-speed factor (sports cars speed, trucks lumber)
+    model: THREE.Group | null;
+}
+
+interface Particle { p: THREE.Vector3; vel: THREE.Vector3; life: number; max: number; kind: 'spark' | 'smoke' | 'debris'; s: number; }
+
+export const AutonomySim: React.FC<SimProps> = React.memo(({ settings, active, activeTool, zoom, timeScale, onUpdateMetrics, onHover, onEvent }) => {
+    const cars = useRef<Car[]>([]);
+    const parts = useRef<Particle[]>([]);
+    const inter = useRef<{ shift: number; override: number; group: THREE.Group | null; nsMat: THREE.MeshStandardMaterial | null; ewMat: THREE.MeshStandardMaterial | null }[]>([]);
+    const stats = useRef({ collisions: 0, completed: 0, startTime: 0, spawnAcc: 0, metricAcc: 0, adaptAcc: 0, waitSamples: [] as number[], gridlockAt: -99 });
+
+    const M = useRef<Record<string, THREE.InstancedMesh>>({});
+    const carGroup = useRef<THREE.Group | null>(null);
+    const singles = useRef<Record<string, any>>({});
+
+    const settingsRef = useRef(settings); settingsRef.current = settings;
+    const toolRef = useRef(activeTool); toolRef.current = activeTool;
+    const cbRef = useRef({ onUpdateMetrics, onHover, onEvent });
+    cbRef.current = { onUpdateMetrics, onHover, onEvent };
+
+    // signal phase for intersection (ix, iz) at sim time t → returns {ns: 'G'|'Y'|'R', ew: ...}
+    const phaseAt = (t: number, ix: number, iz: number) => {
+        const s = settingsRef.current;
+        const g = Math.max(2, s.greenDuration ?? 6);
+        const y = 1.2;
+        const cycle = 2 * (g + y);
+        const waveOff = ((s.greenWave ?? 30) / 100) * cycle * 0.25;
+        const ii = iz * 3 + ix;
+        const st = inter.current[ii];
+        let tl = (t + (ix + iz) * waveOff + (st?.shift ?? 0) + (st?.override ?? 0)) % cycle;
+        if (tl < 0) tl += cycle;
+        if (tl < g) return { ns: 'G', ew: 'R' };
+        if (tl < g + y) return { ns: 'Y', ew: 'R' };
+        if (tl < 2 * g + y) return { ns: 'R', ew: 'G' };
+        return { ns: 'R', ew: 'Y' };
+    };
+
+    const init = (ctx: SimContext) => {
+        const { scene } = ctx;
+        scene.fog = new THREE.Fog(0xcfe2f3, 140, 360);
+        cars.current = []; parts.current = [];
+        stats.current = { collisions: 0, completed: 0, startTime: 0, spawnAcc: 0, metricAcc: 0, adaptAcc: 0, waitSamples: [], gridlockAt: -99 };
+
+        // ground
+        const ground = new THREE.Mesh(new THREE.PlaneGeometry(240, 240), new THREE.MeshStandardMaterial({ color: 0x93c78d, roughness: 1 }));
+        ground.rotation.x = -Math.PI / 2; ground.position.y = -0.12; ground.receiveShadow = true;
+        scene.add(ground);
+
+        // ---- city scenery: buildings & trees fill the blocks between roads ----
+        const onRoad = (x: number, z: number, m: number) => ROAD_POS.some(r => Math.abs(x - r) < m) || ROAD_POS.some(r => Math.abs(z - r) < m);
+        const bldGeo = new THREE.BoxGeometry(1, 1, 1); bldGeo.translate(0, 0.5, 0);
+        const bldMesh = new THREE.InstancedMesh(bldGeo, new THREE.MeshStandardMaterial({ roughness: 0.75 }), 70);
+        bldMesh.castShadow = true; bldMesh.receiveShadow = true;
+        const dummy = new THREE.Object3D();
+        const col = new THREE.Color();
+        const palette = [0xe6ebf1, 0xead9bc, 0xd9a98c, 0xc9d6df, 0xf0e4d0];
+        let bi = 0;
+        for (let tries = 0; tries < 600 && bi < 70; tries++) {
+            const x = (Math.random() - 0.5) * 104, z = (Math.random() - 0.5) * 104;
+            if (onRoad(x, z, 7.5)) continue;
+            const w = 2.5 + Math.random() * 3.5;
+            const h = 2 + Math.random() * (10 - Math.abs(x + z) * 0.05);
+            dummy.position.set(x, 0, z);
+            dummy.scale.set(w, h, 2.5 + Math.random() * 3.5);
+            dummy.rotation.set(0, 0, 0);
+            dummy.updateMatrix();
+            bldMesh.setMatrixAt(bi, dummy.matrix);
+            bldMesh.setColorAt(bi, col.setHex(palette[Math.floor(Math.random() * palette.length)]));
+            bi++;
         }
-        // Stop Lines
-        const stopGeo = new THREE.PlaneGeometry(0.6, 3.8);
-        const s1 = new THREE.Mesh(stopGeo, MAT.stopLine); s1.rotation.x = -Math.PI/2; s1.position.set(-STOP_LINE, 0.02, LANE_OFFSET); markings.add(s1);
-        const s2 = new THREE.Mesh(stopGeo, MAT.stopLine); s2.rotation.x = -Math.PI/2; s2.position.set(STOP_LINE, 0.02, -LANE_OFFSET); markings.add(s2);
-        const s3 = new THREE.Mesh(stopGeo, MAT.stopLine); s3.rotation.x = -Math.PI/2; s3.rotation.z = Math.PI/2; s3.position.set(-LANE_OFFSET, 0.02, -STOP_LINE); markings.add(s3);
-        const s4 = new THREE.Mesh(stopGeo, MAT.stopLine); s4.rotation.x = -Math.PI/2; s4.rotation.z = Math.PI/2; s4.position.set(LANE_OFFSET, 0.02, STOP_LINE); markings.add(s4);
-        
-        // Crosswalks
-        const walkGeo = new THREE.PlaneGeometry(0.5, 3.8);
-        for(let i=0; i<3; i++) {
-            const offset = 4.5 + (i*0.8);
-            const w1 = new THREE.Mesh(walkGeo, MAT.walk); w1.rotation.x = -Math.PI/2; w1.position.set(-offset, 0.02, -LANE_OFFSET); markings.add(w1);
-            const w2 = new THREE.Mesh(walkGeo, MAT.walk); w2.rotation.x = -Math.PI/2; w2.position.set(offset, 0.02, LANE_OFFSET); markings.add(w2);
-            const w3 = new THREE.Mesh(walkGeo, MAT.walk); w3.rotation.x = -Math.PI/2; w3.rotation.z = Math.PI/2; w3.position.set(LANE_OFFSET, 0.02, -offset); markings.add(w3);
-            const w4 = new THREE.Mesh(walkGeo, MAT.walk); w4.rotation.x = -Math.PI/2; w4.rotation.z = Math.PI/2; w4.position.set(-LANE_OFFSET, 0.02, offset); markings.add(w4);
+        for (let i = bi; i < 70; i++) { dummy.position.set(0, -500, 0); dummy.scale.setScalar(0); dummy.updateMatrix(); bldMesh.setMatrixAt(i, dummy.matrix); }
+        scene.add(bldMesh);
+
+        const sceneryTreeGeo = new THREE.ConeGeometry(0.9, 2.6, 7); sceneryTreeGeo.translate(0, 1.3, 0);
+        const treeMesh = new THREE.InstancedMesh(sceneryTreeGeo, new THREE.MeshStandardMaterial({ roughness: 0.9 }), 90);
+        treeMesh.castShadow = true;
+        let ti = 0;
+        for (let tries = 0; tries < 700 && ti < 90; tries++) {
+            const x = (Math.random() - 0.5) * 108, z = (Math.random() - 0.5) * 108;
+            if (onRoad(x, z, 5.5)) continue;
+            const s = 0.7 + Math.random() * 0.8;
+            dummy.position.set(x, 0, z);
+            dummy.scale.set(s, s * (0.8 + Math.random() * 0.5), s);
+            dummy.updateMatrix();
+            treeMesh.setMatrixAt(ti, dummy.matrix);
+            treeMesh.setColorAt(ti, col.setHSL(0.33, 0.5, 0.28 + Math.random() * 0.14));
+            ti++;
         }
+        for (let i = ti; i < 90; i++) { dummy.position.set(0, -500, 0); dummy.scale.setScalar(0); dummy.updateMatrix(); treeMesh.setMatrixAt(i, dummy.matrix); }
+        scene.add(treeMesh);
 
-        scene.add(markings);
+        // roads
+        const roadMat = new THREE.MeshStandardMaterial({ color: 0x353c47, roughness: 0.8 });
+        for (const f of ROAD_POS) {
+            const h = new THREE.Mesh(new THREE.PlaneGeometry(2 * HALF + 16, 8), roadMat);
+            h.rotation.x = -Math.PI / 2; h.position.set(0, 0.0, f); h.receiveShadow = true; scene.add(h);
+            const v = new THREE.Mesh(new THREE.PlaneGeometry(8, 2 * HALF + 16), roadMat);
+            v.rotation.x = -Math.PI / 2; v.position.set(f, 0.01, 0); v.receiveShadow = true; scene.add(v);
+        }
+        // markings
+        const dashMat = new THREE.MeshBasicMaterial({ color: 0xcbd5e1 });
+        const dashGeo = new THREE.PlaneGeometry(1.4, 0.14);
+        const marks = new THREE.Group();
+        for (const f of ROAD_POS) {
+            for (let d = -HALF; d < HALF; d += 3.2) {
+                if (ROAD_POS.some(p => Math.abs(d - p) < 6)) continue;
+                const m1 = new THREE.Mesh(dashGeo, dashMat); m1.rotation.x = -Math.PI / 2; m1.position.set(d, 0.02, f); marks.add(m1);
+                const m2 = new THREE.Mesh(dashGeo, dashMat); m2.rotation.x = -Math.PI / 2; m2.rotation.z = Math.PI / 2; m2.position.set(f, 0.02, d); marks.add(m2);
+            }
+        }
+        // stop lines
+        const stopGeo = new THREE.PlaneGeometry(0.5, 3.4);
+        for (const fx of ROAD_POS) for (const fz of ROAD_POS) {
+            const s1 = new THREE.Mesh(stopGeo, dashMat); s1.rotation.x = -Math.PI / 2; s1.rotation.z = Math.PI / 2; s1.position.set(fx + LANE, 0.02, fz - STOP_GAP); marks.add(s1);
+            const s2 = new THREE.Mesh(stopGeo, dashMat); s2.rotation.x = -Math.PI / 2; s2.rotation.z = Math.PI / 2; s2.position.set(fx - LANE, 0.02, fz + STOP_GAP); marks.add(s2);
+            const s3 = new THREE.Mesh(stopGeo, dashMat); s3.rotation.x = -Math.PI / 2; s3.position.set(fx - STOP_GAP, 0.02, fz - LANE); marks.add(s3);
+            const s4 = new THREE.Mesh(stopGeo, dashMat); s4.rotation.x = -Math.PI / 2; s4.position.set(fx + STOP_GAP, 0.02, fz + LANE); marks.add(s4);
+        }
+        scene.add(marks);
 
-        // Lights & Poles
-        const lightsGroup = new THREE.Group();
-        const poleGeo = new THREE.CylinderGeometry(0.1, 0.15, 5);
-        const armGeo = new THREE.BoxGeometry(3.5, 0.15, 0.15);
-        // Larger Signal Box that glows entirely
-        const signalBoxGeo = new THREE.BoxGeometry(0.8, 1.5, 0.6);
-        
-        const createLight = (x: number, z: number, rot: number) => {
+        // intersections signals
+        inter.current = [];
+        const poleMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.7, roughness: 0.3 });
+        for (let iz = 0; iz < 3; iz++) for (let ix = 0; ix < 3; ix++) {
             const grp = new THREE.Group();
-            grp.position.set(x, 0, z);
-            grp.rotation.y = rot;
-            
-            // Pole
-            const p = new THREE.Mesh(poleGeo, MAT.pole); 
-            p.position.y = 2.5; 
-            p.castShadow = true; 
-            grp.add(p);
-            
-            // Arm
-            const a = new THREE.Mesh(armGeo, MAT.pole); 
-            a.position.set(1.0, 4.8, 0); 
-            grp.add(a);
-            
-            // Signal Head - The main visual indicator
-            const sig = new THREE.Mesh(signalBoxGeo, new THREE.MeshStandardMaterial({ 
-                color: 0x333333, 
-                emissive: 0x000000,
-                roughness: 0.2
-            }));
-            sig.position.set(2.5, 4.6, 0);
-            sig.name = "signalHead";
-            grp.add(sig);
+            grp.position.set(ROAD_POS[ix], 0, ROAD_POS[iz]);
+            const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.16, 6), poleMat);
+            pole.position.set(5.2, 3, 5.2); pole.castShadow = true;
+            grp.add(pole);
+            const arm = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.14, 4.4), poleMat);
+            arm.position.set(5.2, 5.7, 3.2); grp.add(arm);
+            const arm2 = new THREE.Mesh(new THREE.BoxGeometry(4.4, 0.14, 0.14), poleMat);
+            arm2.position.set(3.2, 5.7, 5.2); grp.add(arm2);
+            const nsMat = new THREE.MeshStandardMaterial({ color: 0x222222, emissive: 0x00ff00, emissiveIntensity: 1 });
+            const ewMat = new THREE.MeshStandardMaterial({ color: 0x222222, emissive: 0xff0000, emissiveIntensity: 1 });
+            const nsSig = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.6, 0.5), nsMat);
+            nsSig.position.set(5.2, 5.0, 1.2); grp.add(nsSig);
+            const ewSig = new THREE.Mesh(new THREE.BoxGeometry(0.5, 1.6, 0.9), ewMat);
+            ewSig.position.set(1.2, 5.0, 5.2); grp.add(ewSig);
+            scene.add(grp);
+            inter.current.push({ shift: 0, override: 0, group: grp, nsMat, ewMat });
+        }
 
-            // Add a point light to the signal so it illuminates the road
-            const lamp = new THREE.PointLight(0x000000, 2, 10);
-            lamp.position.set(2.5, 4.0, 0);
-            lamp.name = "signalLight";
-            grp.add(lamp);
-            
-            return grp;
+        carGroup.current = new THREE.Group();
+        scene.add(carGroup.current);
+
+        // particles
+        const mk = (key: string, geo: THREE.BufferGeometry, mat: THREE.Material, count: number) => {
+            const m = new THREE.InstancedMesh(geo, mat, count);
+            m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+            m.frustumCulled = false;
+            scene.add(m);
+            M.current[key] = m;
         };
+        mk('spark', new THREE.DodecahedronGeometry(0.5), new THREE.MeshBasicMaterial({ color: 0xff5510, transparent: true, opacity: 0.85, depthWrite: false }), 400);
+        mk('smoke', new THREE.IcosahedronGeometry(0.7, 0), new THREE.MeshBasicMaterial({ color: 0x707784, transparent: true, opacity: 0.35, depthWrite: false }), 400);
+        mk('debris', new THREE.BoxGeometry(0.3, 0.3, 0.3), new THREE.MeshStandardMaterial({ color: 0x4a4f58, roughness: 0.6, metalness: 0.6 }), 150);
 
-        // Positioning lights at corners
-        lightsGroup.add(createLight(6, 6, -Math.PI/2));  // NE
-        lightsGroup.add(createLight(-6, 6, Math.PI));    // NW
-        lightsGroup.add(createLight(-6, -6, Math.PI/2)); // SW
-        lightsGroup.add(createLight(6, -6, 0));          // SE
-        
-        scene.add(lightsGroup);
-        // @ts-ignore
-        lightMeshRef.current = lightsGroup;
-
-        // Cars Container
-        const carGroup = new THREE.Group();
-        scene.add(carGroup);
-        // @ts-ignore
-        carGroupRef.current = carGroup;
-        
-        // --- Particle Systems for Explosions ---
-        
-        // 1. Fire (Dodecahedrons) - Additive Blending for Glow
-        const pGeo = new THREE.DodecahedronGeometry(0.8); 
-        const pMat = new THREE.MeshBasicMaterial({ 
-            color: 0xff4500, // OrangeRed
-            transparent: true, 
-            opacity: 0.6, // Very Subtle
-            blending: THREE.AdditiveBlending,
-            depthWrite: false
-        }); 
-        const pMesh = new THREE.InstancedMesh(pGeo, pMat, 2000);
-        pMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-        pMesh.frustumCulled = false;
-        scene.add(pMesh);
-        // @ts-ignore
-        particleMeshRef.current = pMesh;
-
-        // 2. Smoke (Spheres)
-        const sGeo = new THREE.IcosahedronGeometry(1.0, 1);
-        const sMat = new THREE.MeshBasicMaterial({ 
-            color: 0x888888, 
-            transparent: true, 
-            opacity: 0.3, // Very Subtle
-            depthWrite: false
-        });
-        const sMesh = new THREE.InstancedMesh(sGeo, sMat, 2000);
-        sMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-        sMesh.frustumCulled = false;
-        scene.add(sMesh);
-        // @ts-ignore
-        smokeMeshRef.current = sMesh;
-
-        // 3. Debris (Chunks)
-        const dGeo = new THREE.BoxGeometry(0.4, 0.4, 0.4);
-        const dMat = new THREE.MeshStandardMaterial({ color: 0x555555, roughness: 0.5, metalness: 0.8 });
-        const dMesh = new THREE.InstancedMesh(dGeo, dMat, 500);
-        dMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-        dMesh.frustumCulled = false;
-        scene.add(dMesh);
-        // @ts-ignore
-        debrisMeshRef.current = dMesh;
-
-        // 4. Flash (Big Sphere)
-        const fGeo = new THREE.SphereGeometry(1.0, 16, 16);
-        const fMat = new THREE.MeshBasicMaterial({ 
-            color: 0xffffff, 
-            transparent: true, 
-            opacity: 0.4, // Very Subtle
-            blending: THREE.AdditiveBlending,
-            depthWrite: false
-        });
-        const fMesh = new THREE.InstancedMesh(fGeo, fMat, 50);
-        fMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-        fMesh.frustumCulled = false;
-        scene.add(fMesh);
-        // @ts-ignore
-        flashMeshRef.current = fMesh;
-
-        // 5. Shockwave (Ring)
-        const swGeo = new THREE.RingGeometry(0.5, 1.0, 32);
-        const swMat = new THREE.MeshBasicMaterial({
-            color: 0xffaa00,
-            transparent: true,
-            opacity: 0.2, // Very Subtle
-            blending: THREE.AdditiveBlending,
-            side: THREE.DoubleSide,
-            depthWrite: false
-        });
-        const swMesh = new THREE.InstancedMesh(swGeo, swMat, 50);
-        swMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-        swMesh.frustumCulled = false;
-        scene.add(swMesh);
-        // @ts-ignore
-        shockwaveMeshRef.current = swMesh;
-
-        carsRef.current = [];
-        particlesRef.current = [];
-        collisionCountRef.current = 0;
+        // click plane
+        const plane = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshBasicMaterial({ visible: false }));
+        plane.rotation.x = -Math.PI / 2;
+        scene.add(plane);
+        singles.current.plane = plane;
     };
 
-    const createCarModel = (color: THREE.Color) => {
-        const car = new THREE.Group();
-        // Chassis
-        const chassis = new THREE.Mesh(new THREE.BoxGeometry(CAR_WIDTH, 0.6, CAR_LENGTH), new THREE.MeshStandardMaterial({ color: color, roughness: 0.2, metalness: 0.4 }));
-        chassis.position.y = 0.5; chassis.castShadow = true;
-        car.add(chassis);
-        
-        // Cabin
-        const cabin = new THREE.Mesh(new THREE.BoxGeometry(CAR_WIDTH - 0.1, 0.5, 1.3), new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.1, metalness: 0.8 }));
-        cabin.position.set(0, 1.0, -0.1);
-        car.add(cabin);
-
-        // Brake Lights
-        const brakeGeo = new THREE.PlaneGeometry(0.4, 0.2);
-        const brakeMat = new THREE.MeshBasicMaterial({ color: 0x330000 }); // Off state
-        const bl = new THREE.Mesh(brakeGeo, brakeMat.clone()); bl.position.set(0.3, 0.6, CAR_LENGTH/2 + 0.01); bl.name = 'brakeRight'; car.add(bl);
-        const br = new THREE.Mesh(brakeGeo, brakeMat.clone()); br.position.set(-0.3, 0.6, CAR_LENGTH/2 + 0.01); br.name = 'brakeLeft'; car.add(br);
-        
-        // Headlights
-        const headGeo = new THREE.PlaneGeometry(0.3, 0.2);
-        const headMat = new THREE.MeshBasicMaterial({ color: 0xffffcc });
-        const hl = new THREE.Mesh(headGeo, headMat); hl.position.set(0.35, 0.5, -CAR_LENGTH/2 - 0.01); hl.rotation.y = Math.PI; car.add(hl);
-        const hr = new THREE.Mesh(headGeo, headMat); hr.position.set(-0.35, 0.5, -CAR_LENGTH/2 - 0.01); hr.rotation.y = Math.PI; car.add(hr);
-
-        // Wheels
-        const wheelGeo = new THREE.CylinderGeometry(0.35, 0.35, 0.3, 16);
-        wheelGeo.rotateZ(Math.PI / 2);
-        const wheelMat = new THREE.MeshStandardMaterial({ color: 0x0f172a });
-        const positions = [ { x: 0.55, z: 0.7 }, { x: 0.55, z: -0.7 }, { x: -0.55, z: 0.7 }, { x: -0.55, z: -0.7 } ];
-        positions.forEach(p => { const w = new THREE.Mesh(wheelGeo, wheelMat); w.position.set(p.x, 0.35, p.z); car.add(w); });
-        
-        return car;
+    const buildCar = (hue: number, type: VType, len: number) => {
+        const g = new THREE.Group();
+        const col = new THREE.Color().setHSL(hue, 0.7, 0.5);
+        const bodyMat = new THREE.MeshStandardMaterial({ color: col, roughness: 0.25, metalness: 0.5 });
+        const glassMat = new THREE.MeshStandardMaterial({ color: 0x1a2333, roughness: 0.1, metalness: 0.8 });
+        if (type === 'truck') {
+            const cab = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.9, 1.0), bodyMat);
+            cab.position.set(0, 0.65, -len / 2 + 0.55); cab.castShadow = true; g.add(cab);
+            const cargo = new THREE.Mesh(new THREE.BoxGeometry(1.2, 1.1, len - 1.3), new THREE.MeshStandardMaterial({ color: 0xe8e8ec, roughness: 0.6 }));
+            cargo.position.set(0, 0.78, 0.55); cargo.castShadow = true; g.add(cargo);
+        } else if (type === 'sport') {
+            const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.05, 0.36, len), bodyMat);
+            chassis.position.y = 0.38; chassis.castShadow = true; g.add(chassis);
+            const cabin = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.3, 0.95), glassMat);
+            cabin.position.set(0, 0.68, 0.05); g.add(cabin);
+        } else {
+            const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.5, len), bodyMat);
+            chassis.position.y = 0.45; chassis.castShadow = true; g.add(chassis);
+            const cabin = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.42, 1.1), glassMat);
+            cabin.position.set(0, 0.85, -0.1); g.add(cabin);
+        }
+        const brakeMat = new THREE.MeshBasicMaterial({ color: 0x330000 });
+        const brake = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 0.18), brakeMat);
+        brake.position.set(0, 0.55, len / 2 + 0.01); brake.name = 'brake'; g.add(brake);
+        const headMat = new THREE.MeshBasicMaterial({ color: 0xfff7cc });
+        const hl = new THREE.Mesh(new THREE.PlaneGeometry(0.85, 0.15), headMat);
+        hl.position.set(0, 0.45, -len / 2 - 0.01); hl.rotation.y = Math.PI; g.add(hl);
+        const wGeo = new THREE.CylinderGeometry(0.28, 0.28, 0.22, 12); wGeo.rotateZ(Math.PI / 2);
+        const wMat = new THREE.MeshStandardMaterial({ color: 0x0f172a });
+        const wz = len / 2 - 0.42;
+        for (const [x, z] of [[0.52, wz], [0.52, -wz], [-0.52, wz], [-0.52, -wz]]) {
+            const w = new THREE.Mesh(wGeo, wMat); w.position.set(x, 0.28, z); g.add(w);
+        }
+        return g;
     };
 
-    const spawnCar = () => {
-        const dir = Math.floor(Math.random()*4); 
-        const pos = new THREE.Vector3(); 
-        const SPAWN_DIST = 45;
-        
-        if (dir===0) { pos.set(-LANE_OFFSET, 0, -SPAWN_DIST); } 
-        if (dir===1) { pos.set(LANE_OFFSET, 0, SPAWN_DIST); } 
-        if (dir===2) { pos.set(-SPAWN_DIST, 0, LANE_OFFSET); } 
-        if (dir===3) { pos.set(SPAWN_DIST, 0, -LANE_OFFSET); }
-
-        // Start with realistic highway speed entrance
-        const initSpeed = (settings.speedLimit / 250); 
-
-        carsRef.current.push({ 
-            id: Math.random(),
-            pos, 
-            vel: initSpeed, 
-            acc: 0,
-            dir, 
-            axis: dir < 2 ? 'NS' : 'EW', 
-            dist: SPAWN_DIST, 
-            crashed: false,
-            remove: false,
-            braking: false,
-            color: new THREE.Color().setHSL(Math.random(), 0.7, 0.5), 
+    const spawnCar = (laneIdx?: number) => {
+        const lane = LANES[laneIdx ?? Math.floor(Math.random() * LANES.length)];
+        // don't spawn on top of another car
+        for (const c of cars.current) {
+            if (c.lane === lane && c.u < -HALF + 7) return;
+        }
+        const s = settingsRef.current;
+        const r = Math.random();
+        const type: VType = r < 0.16 ? 'truck' : r < 0.3 ? 'sport' : 'car';
+        cars.current.push({
+            lane, u: -HALF, v: (s.speedLimit ?? 50) * 0.1,
+            crashed: false, wreckTimer: 0, braking: false, waiting: 0, totalWait: 0,
+            hue: Math.random(), type,
+            len: type === 'truck' ? 3.4 : type === 'sport' ? 2.0 : CAR_LEN,
+            vf: type === 'truck' ? 0.8 : type === 'sport' ? 1.3 : 1,
             model: null,
-            box: new THREE.Box3()
         });
     };
 
-    const animate = (scene: THREE.Scene, camera: THREE.Camera, renderer: THREE.WebGLRenderer, frame: number) => {
-        if (!lightMeshRef.current || !carGroupRef.current) return;
-        
-        // --- Traffic Light Logic ---
-        timerRef.current++; 
-        const greenDuration = settings.greenLightDuration * 60;
-        const yellowDuration = 90; 
-        
-        if (timerRef.current > greenDuration + yellowDuration) { 
-            lightsRef.current = lightsRef.current === 'red' ? 'green' : 'red'; 
-            timerRef.current = 0; 
-        }
-
-        const isYellow = timerRef.current > greenDuration;
-
-        // Visual Colors
-        const GREEN_COLOR = 0x22c55e;
-        const RED_COLOR = 0xef4444;
-        const YELLOW_COLOR = 0xeab308;
-
-        const nsColor = lightsRef.current === 'green' ? (isYellow ? YELLOW_COLOR : GREEN_COLOR) : RED_COLOR;
-        const ewColor = lightsRef.current === 'red' ? GREEN_COLOR : RED_COLOR; // Simplified 
-        
-        const updateSignal = (idx: number, col: number) => {
-             const grp = lightMeshRef.current!.children[idx] as THREE.Group;
-             const mesh = grp.getObjectByName('signalHead') as THREE.Mesh;
-             const light = grp.getObjectByName('signalLight') as THREE.PointLight;
-             if(mesh) {
-                 (mesh.material as THREE.MeshStandardMaterial).color.setHex(col);
-                 (mesh.material as THREE.MeshStandardMaterial).emissive.setHex(col);
-             }
-             if(light) light.color.setHex(col);
-        };
-        
-        // NS Green -> Light 1 and 3 are Green.
-        // EW Green -> Light 0 and 2 are Green.
-
-        updateSignal(1, nsColor); updateSignal(3, nsColor); // North/South Lights
-        updateSignal(0, ewColor); updateSignal(2, ewColor); // East/West Lights
-
-        // --- Car Physics & Logic ---
-        // Convert settings to Physics Constants
-        const frictionCoeff = 0.05 + (settings.roadFriction / 100) * 0.25; 
-        const maxSpeed = settings.speedLimit / 180; 
-        const aggression = settings.driverAggression / 100;
-        
-        let activeCarsCount = 0;
-        let avgSpeedSum = 0;
-
-        // 1. Update Physics State
-        carsRef.current.forEach(c => {
-            if (c.crashed || c.remove) return; 
-
-            // A. Environmental Awareness
-            let targetDist = 999;
-            const distToStopLine = c.dist - STOP_LINE - (CAR_LENGTH/2); 
-            const isNS = c.dir < 2;
-            const isGreen = isNS ? lightsRef.current === 'green' : lightsRef.current === 'red';
-            
-            // Check Stop Lights
-            if (distToStopLine > 0 && distToStopLine < 40) { 
-                 if (!isGreen && !isYellow) { 
-                     // Red Light
-                     if (distToStopLine < 5 && c.vel > maxSpeed * 0.8 && aggression > 0.8) {
-                         // Run red light
-                     } else {
-                         targetDist = distToStopLine;
-                     }
-                 } else if (isYellow) {
-                     if (distToStopLine > 10 || aggression < 0.3) {
-                        targetDist = distToStopLine;
-                     }
-                 }
-            }
-
-            // Check Car Ahead
-            carsRef.current.forEach(other => {
-                if (c === other || other.dir !== c.dir || other.remove) return;
-                const gap = c.dist - other.dist - CAR_LENGTH * 1.5; 
-                if (gap > 0 && gap < 50) {
-                    if (gap < targetDist) targetDist = gap;
-                }
-            });
-
-            // B. Physics Calc
-            const requiredBrakingDist = (c.vel * c.vel) / (2 * frictionCoeff * 0.5); 
-            
-            if (targetDist < requiredBrakingDist + 1.0) {
-                c.braking = true;
-                c.acc = -frictionCoeff * (targetDist < 2 ? 1.0 : 0.5); 
-            } else {
-                c.braking = false;
-                const speedRatio = c.vel / maxSpeed;
-                if (speedRatio < 1.0) {
-                    c.acc = 0.005 * (1 + aggression); 
-                } else {
-                    c.acc = 0; 
-                }
-            }
-
-            c.vel += c.acc;
-            if (c.vel < 0) c.vel = 0; 
-            
-            c.dist -= c.vel;
-            
-            if (c.dir === 0) c.pos.z = -c.dist;
-            if (c.dir === 1) c.pos.z = c.dist;
-            if (c.dir === 2) c.pos.x = -c.dist;
-            if (c.dir === 3) c.pos.x = c.dist;
-            
-            const halfW = c.axis === 'NS' ? CAR_WIDTH/2 : CAR_LENGTH/2;
-            const halfL = c.axis === 'NS' ? CAR_LENGTH/2 : CAR_WIDTH/2;
-            c.box.min.set(c.pos.x - halfW + 0.1, 0, c.pos.z - halfL + 0.1);
-            c.box.max.set(c.pos.x + halfW - 0.1, CAR_HEIGHT, c.pos.z + halfL - 0.1);
-
-            avgSpeedSum += c.vel;
-            
-            if (c.dist < -55) {
-                c.remove = true;
-            }
-        });
-
-        // 2. Collision Detection
-        for (let i = 0; i < carsRef.current.length; i++) {
-            const c1 = carsRef.current[i];
-            if (!c1.model || c1.crashed || c1.remove) continue;
-            
-            for (let j = i + 1; j < carsRef.current.length; j++) {
-                const c2 = carsRef.current[j];
-                if (!c2.model || c2.remove) continue; 
-
-                if (c1.box.intersectsBox(c2.box)) {
-                     c1.crashed = true; 
-                     c2.crashed = true;
-                     c1.remove = true; 
-                     c2.remove = true; 
-                     collisionCountRef.current++;
-                     
-                     // Use mid point and higher up for visibility
-                     const mid = c1.pos.clone().add(c2.pos).multiplyScalar(0.5);
-                     mid.y += 0.5; // Lower
-                     spawnExplosion(mid);
-                }
-            }
-        }
-
-        // 3. Render Updates & Cleanup
-        const survivingCars: typeof carsRef.current = [];
-        
-        carsRef.current.forEach(c => {
-            if (c.remove) {
-                if (c.model && carGroupRef.current) {
-                    carGroupRef.current.remove(c.model);
-                }
-                return; 
-            }
-
-            if (!c.model && carGroupRef.current) {
-                c.model = createCarModel(c.color);
-                carGroupRef.current.add(c.model);
-            }
-            
-            if (c.model) {
-                c.model.position.copy(c.pos);
-                if (c.dir === 0) c.model.rotation.y = Math.PI;
-                if (c.dir === 1) c.model.rotation.y = 0;
-                if (c.dir === 2) c.model.rotation.y = -Math.PI/2;
-                if (c.dir === 3) c.model.rotation.y = Math.PI/2;
-                
-                const bl = c.model.getObjectByName('brakeLeft') as THREE.Mesh;
-                const br = c.model.getObjectByName('brakeRight') as THREE.Mesh;
-                if (bl && br) {
-                    const bColor = c.braking ? 0xff0000 : 0x330000;
-                    (bl.material as THREE.MeshBasicMaterial).color.setHex(bColor);
-                    (br.material as THREE.MeshBasicMaterial).color.setHex(bColor);
-                }
-            }
-            survivingCars.push(c);
-            activeCarsCount++;
-        });
-        carsRef.current = survivingCars;
-
-        // 4. Spawner
-        const targetDensity = settings.trafficDensity; 
-        if (activeCarsCount < targetDensity / 2) {
-            if (Math.random() < 0.05) spawnCar();
-        }
-
-        // 5. Particles
-        updateParticles();
-
-        // 6. Metrics
-        if (frame % 30 === 0) {
-            const avgSpeed = activeCarsCount > 0 ? (avgSpeedSum / activeCarsCount) * 400 : 0;
-            const nsStatus = lightsRef.current === 'green' ? (isYellow ? 'YEL' : 'GRN') : 'RED';
-            const nsHealth = nsStatus === 'GRN' ? 'good' : (nsStatus === 'YEL' ? 'warning' : 'critical');
-            
-            const ewStatus = lightsRef.current === 'red' ? 'GRN' : 'RED'; // Simplified
-            const ewHealth = ewStatus === 'GRN' ? 'good' : 'critical';
-
-            onUpdateMetrics([
-                { label: 'Vehicles', value: activeCarsCount, status: 'neutral' },
-                { label: 'Avg Speed', value: Math.floor(avgSpeed), unit: 'km/h', status: avgSpeed < 20 ? 'warning' : 'neutral' },
-                { label: 'Collisions', value: collisionCountRef.current, status: collisionCountRef.current > 0 ? 'critical' : 'good' },
-                // Split Lights into 4
-                { label: 'Light N', value: nsStatus, status: nsHealth },
-                { label: 'Light S', value: nsStatus, status: nsHealth },
-                { label: 'Light E', value: ewStatus, status: ewHealth },
-                { label: 'Light W', value: ewStatus, status: ewHealth }
-            ]);
-        }
+    const worldPos = (c: Car): [number, number, number] => {
+        // right-hand traffic lane offset
+        const off = LANE * (c.lane.axis === 'NS' ? c.lane.sign : -c.lane.sign);
+        const coord = c.u * c.lane.sign;
+        return c.lane.axis === 'NS' ? [c.lane.fixed + off, 0, coord] : [coord, 0, c.lane.fixed + off];
     };
 
     const spawnExplosion = (pos: THREE.Vector3) => {
-        // Very subtle localized effects
-        
-        // 1. Tiny Fireball
-        for(let i=0; i<8; i++) { 
-            particlesRef.current.push({
-                pos: pos.clone().add(new THREE.Vector3((Math.random()-0.5)*0.5, Math.random()*0.3, (Math.random()-0.5)*0.5)),
-                vel: new THREE.Vector3((Math.random()-0.5)*0.1, 0.1 + Math.random()*0.2, (Math.random()-0.5)*0.1),
-                life: 1.0 + Math.random() * 1.0, 
-                maxLife: 2.0,
-                type: 'fire',
-                scale: 0.2 + Math.random() * 0.3
-            });
-        }
-        
-        // 2. Tiny Puff of Smoke
-        for(let i=0; i<6; i++) {
-            particlesRef.current.push({
-                pos: pos.clone().add(new THREE.Vector3((Math.random()-0.5)*0.5, 0.5, (Math.random()-0.5)*0.5)),
-                vel: new THREE.Vector3((Math.random()-0.5)*0.05, 0.2 + Math.random()*0.1, (Math.random()-0.5)*0.05),
-                life: 2.0 + Math.random() * 2.0, 
-                maxLife: 4.0,
-                type: 'smoke',
-                scale: 0.4 + Math.random() * 0.4
-            });
-        }
-        
-        // 3. Very Few Debris
-        for(let i=0; i<4; i++) {
-            particlesRef.current.push({
-                pos: pos.clone(),
-                vel: new THREE.Vector3((Math.random()-0.5)*1.5, 1.5 + Math.random()*1, (Math.random()-0.5)*1.5),
-                rot: new THREE.Vector3(Math.random(), Math.random(), Math.random()),
-                life: 2.0, 
-                maxLife: 2.0,
-                type: 'debris',
-                scale: 0.1 + Math.random() * 0.1
-            });
-        }
-        
-        // 4. Faint Flash
-        particlesRef.current.push({
-            pos: pos.clone(),
-            vel: new THREE.Vector3(0,0,0),
-            life: 0.2, 
-            maxLife: 0.2,
-            type: 'flash',
-            scale: 0.5
-        });
-
-        // 5. Subtle Shockwave
-        particlesRef.current.push({
-            pos: new THREE.Vector3(pos.x, 0.1, pos.z),
-            vel: new THREE.Vector3(0,0,0),
-            life: 0.5, 
-            maxLife: 0.5,
-            type: 'shockwave',
-            scale: 0.1
-        });
+        for (let i = 0; i < 14; i++) parts.current.push({ p: pos.clone().add(new THREE.Vector3((Math.random() - 0.5), Math.random() * 0.6, (Math.random() - 0.5))), vel: new THREE.Vector3((Math.random() - 0.5) * 3, 2 + Math.random() * 3, (Math.random() - 0.5) * 3), life: 0.8 + Math.random() * 0.5, max: 1.2, kind: 'spark', s: 0.3 + Math.random() * 0.4 });
+        for (let i = 0; i < 10; i++) parts.current.push({ p: pos.clone(), vel: new THREE.Vector3((Math.random() - 0.5) * 0.8, 1 + Math.random(), (Math.random() - 0.5) * 0.8), life: 2.4 + Math.random() * 1.5, max: 4, kind: 'smoke', s: 0.5 + Math.random() * 0.6 });
+        for (let i = 0; i < 8; i++) parts.current.push({ p: pos.clone(), vel: new THREE.Vector3((Math.random() - 0.5) * 6, 3 + Math.random() * 3, (Math.random() - 0.5) * 6), life: 1.6, max: 1.6, kind: 'debris', s: 0.25 + Math.random() * 0.3 });
     };
 
-    const updateParticles = () => {
-        const dummy = new THREE.Object3D();
-        const nextParticles: typeof particlesRef.current = [];
-        
-        let fireIdx = 0;
-        let smokeIdx = 0;
-        let debrisIdx = 0;
-        let flashIdx = 0;
-        let shockwaveIdx = 0;
-        
-        particlesRef.current.forEach(p => {
-            p.life -= 0.02;
-            p.pos.add(p.vel);
-            
-            if (p.type === 'fire') {
-                p.vel.multiplyScalar(0.95); 
-                p.vel.y += 0.002; 
-                const scale = (p.life / p.maxLife) * p.scale;
-                
-                dummy.position.copy(p.pos);
-                dummy.scale.setScalar(scale);
-                dummy.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
-                dummy.updateMatrix();
-                
-                if (particleMeshRef.current && fireIdx < 2000) {
-                    particleMeshRef.current.setMatrixAt(fireIdx, dummy.matrix);
-                    fireIdx++;
-                }
+    const animate = (ctx: SimContext) => {
+        const s = settingsRef.current;
+        const dt = ctx.dt;
+        const t = ctx.time;
+        const st = stats.current;
 
-            } else if (p.type === 'smoke') {
-                p.vel.multiplyScalar(0.98); 
-                p.vel.y += 0.002; 
-                const lifeRatio = p.life / p.maxLife;
-                const scale = p.scale * (1 + (1-lifeRatio)*0.5); 
-                
-                dummy.position.copy(p.pos);
-                dummy.scale.setScalar(scale * Math.min(1, lifeRatio*4));
-                dummy.updateMatrix();
-                
-                if (smokeMeshRef.current && smokeIdx < 2000) {
-                    smokeMeshRef.current.setMatrixAt(smokeIdx++, dummy.matrix);
-                }
+        // IDM parameters
+        const friction = Math.max(0.2, (s.roadFriction ?? 100) / 100);
+        const v0 = Math.max(2, (s.speedLimit ?? 50) * 0.14);
+        const aggr = (s.driverAggression ?? 30) / 100;
+        const aMax = 2.2 * friction * (1 + aggr * 0.8);
+        const bComf = 3.0 * friction;
+        const T_headway = Math.max(0.35, 1.6 - aggr * 1.3);
+        const s0 = 1.3;
 
-            } else if (p.type === 'debris') {
-                p.vel.y -= 0.1; // Stronger Gravity
-                if (p.pos.y < 0.2) { 
-                    p.pos.y = 0.2; 
-                    p.vel.y *= -0.4; // Bounce
-                    p.vel.x *= 0.6; p.vel.z *= 0.6; // Friction
-                }
-                
-                if (p.rot) {
-                    dummy.rotation.x += p.rot.x;
-                    dummy.rotation.y += p.rot.y;
-                }
-                
-                dummy.position.copy(p.pos);
-                dummy.scale.setScalar(p.scale);
-                dummy.updateMatrix();
-                
-                if (debrisMeshRef.current && debrisIdx < 500) {
-                    debrisMeshRef.current.setMatrixAt(debrisIdx++, dummy.matrix);
-                }
+        // update signal visuals
+        for (let iz = 0; iz < 3; iz++) for (let ix = 0; ix < 3; ix++) {
+            const ph = phaseAt(t, ix, iz);
+            const ii = iz * 3 + ix;
+            const rec = inter.current[ii];
+            if (rec?.nsMat && rec.ewMat) {
+                rec.nsMat.emissive.setHex(ph.ns === 'G' ? 0x22c55e : ph.ns === 'Y' ? 0xeab308 : 0xef4444);
+                rec.ewMat.emissive.setHex(ph.ew === 'G' ? 0x22c55e : ph.ew === 'Y' ? 0xeab308 : 0xef4444);
+            }
+        }
 
-            } else if (p.type === 'flash') {
-                p.scale += 0.1; // Slower expansion
-                dummy.position.copy(p.pos);
-                dummy.scale.setScalar(p.scale);
-                dummy.updateMatrix();
-                if (flashMeshRef.current && flashIdx < 50) {
-                    flashMeshRef.current.setMatrixAt(flashIdx++, dummy.matrix);
+        // adaptive signals: queue-actuated phase advance
+        st.adaptAcc += dt;
+        const adaptivity = (s.adaptiveSignals ?? 0) / 100;
+        if (st.adaptAcc > 1 && adaptivity > 0) {
+            st.adaptAcc = 0;
+            const queues: { ns: number; ew: number }[] = Array(9).fill(0).map(() => ({ ns: 0, ew: 0 }));
+            for (const c of cars.current) {
+                if (c.v > 0.5 || c.crashed) continue;
+                const coord = c.u * c.lane.sign;
+                for (let k = 0; k < 3; k++) {
+                    const d = ROAD_POS[k] * c.lane.sign - c.u;
+                    if (d > 0 && d < 14) {
+                        const fixedIdx = ROAD_POS.indexOf(c.lane.fixed);
+                        const ii = c.lane.axis === 'NS' ? k * 3 + fixedIdx : ROAD_POS.indexOf(ROAD_POS[k]) + 0; // NS: iz=k, ix=fixedIdx
+                        const idx = c.lane.axis === 'NS' ? k * 3 + fixedIdx : fixedIdx * 3 + k;
+                        if (c.lane.axis === 'NS') queues[idx].ns++; else queues[idx].ew++;
+                    }
                 }
-            } else if (p.type === 'shockwave') {
-                p.scale += 0.05; // Very slow expansion
-                dummy.position.copy(p.pos);
-                dummy.scale.set(p.scale, p.scale, 1);
-                dummy.rotation.x = -Math.PI/2;
-                dummy.updateMatrix();
-                if (shockwaveMeshRef.current && shockwaveIdx < 50) {
-                    shockwaveMeshRef.current.setMatrixAt(shockwaveIdx++, dummy.matrix);
+            }
+            for (let iz = 0; iz < 3; iz++) for (let ix = 0; ix < 3; ix++) {
+                const ii = iz * 3 + ix;
+                const ph = phaseAt(t, ix, iz);
+                const q = queues[ii];
+                // if green side empty and red side has a queue, advance phase
+                if (ph.ns === 'G' && q.ns === 0 && q.ew > 1 && Math.random() < adaptivity) inter.current[ii].shift += 2.5;
+                if (ph.ew === 'G' && q.ew === 0 && q.ns > 1 && Math.random() < adaptivity) inter.current[ii].shift += 2.5;
+            }
+        }
+
+        // --- car physics ---
+        let speedSum = 0, movingCount = 0, waitingCount = 0;
+        for (const c of cars.current) {
+            if (c.crashed) { c.wreckTimer -= dt; continue; }
+
+            // find nearest obstacle distance (leader car or red light stop line)
+            const v0c = v0 * c.vf;
+            let gap = 999;
+            let leaderV = v0c;
+            for (const o of cars.current) {
+                if (o === c || o.lane.axis !== c.lane.axis || o.lane.fixed !== c.lane.fixed || o.lane.sign !== c.lane.sign) continue;
+                const du = o.u - c.u - (o.len + c.len) / 2;
+                if (du > 0 && du < gap) { gap = du; leaderV = o.crashed ? 0 : o.v; }
+            }
+            // signals along the way
+            for (let k = 0; k < 3; k++) {
+                const uInt = ROAD_POS[k] * c.lane.sign;
+                const dStop = uInt - STOP_GAP - c.u - c.len / 2;
+                if (dStop < -1 || dStop > 45) continue;
+                const fixedIdx = ROAD_POS.indexOf(c.lane.fixed);
+                const [ix, iz] = c.lane.axis === 'NS' ? [fixedIdx, k] : [k, fixedIdx];
+                const ph = phaseAt(t, ix, iz);
+                const mine = c.lane.axis === 'NS' ? ph.ns : ph.ew;
+                if (mine === 'R' || (mine === 'Y' && (dStop > 6 || aggr < 0.35))) {
+                    // aggressive drivers run lights when close & fast
+                    const runsIt = mine === 'R' && aggr > 0.75 && dStop < 3 && c.v > v0c * 0.7 && Math.random() < 0.4;
+                    if (!runsIt && dStop > -1 && dStop < gap) { gap = Math.max(0.01, dStop); leaderV = 0; }
                 }
             }
 
-            if (p.life > 0) nextParticles.push(p);
-        });
-        particlesRef.current = nextParticles;
+            // IDM acceleration
+            const dv = c.v - leaderV;
+            const sStar = s0 + Math.max(0, c.v * T_headway + (c.v * dv) / (2 * Math.sqrt(aMax * bComf)));
+            const acc = aMax * (1 - Math.pow(c.v / v0c, 4) - Math.pow(sStar / Math.max(0.1, gap), 2));
+            c.braking = acc < -0.6;
+            c.v = Math.max(0, c.v + acc * dt);
+            c.u += c.v * dt;
 
-        const hide = (mesh: THREE.InstancedMesh | null, startIdx: number, max: number) => {
-            if (!mesh) return;
-            dummy.position.set(0, -500, 0); dummy.scale.set(0,0,0); dummy.updateMatrix();
-            for(let i=startIdx; i<max; i++) mesh.setMatrixAt(i, dummy.matrix);
+            if (c.v < 0.3) { c.waiting += dt; c.totalWait += dt; waitingCount++; }
+            else c.waiting = 0;
+            speedSum += c.v; movingCount++;
+        }
+
+        // collisions: pairwise AABB in world space
+        for (let i = 0; i < cars.current.length; i++) {
+            const a = cars.current[i];
+            if (a.crashed) continue;
+            const [ax, , az] = worldPos(a);
+            for (let j = i + 1; j < cars.current.length; j++) {
+                const b = cars.current[j];
+                if (b.crashed) continue;
+                const [bx, , bz] = worldPos(b);
+                const aw = a.lane.axis === 'NS' ? 0.55 : a.len / 2 - 0.15;
+                const al = a.lane.axis === 'NS' ? a.len / 2 - 0.15 : 0.55;
+                const bw = b.lane.axis === 'NS' ? 0.55 : b.len / 2 - 0.15;
+                const bl = b.lane.axis === 'NS' ? b.len / 2 - 0.15 : 0.55;
+                if (Math.abs(ax - bx) < aw + bw && Math.abs(az - bz) < al + bl) {
+                    a.crashed = b.crashed = true;
+                    a.wreckTimer = b.wreckTimer = 7;
+                    a.v = b.v = 0;
+                    stats.current.collisions++;
+                    spawnExplosion(new THREE.Vector3((ax + bx) / 2, 0.6, (az + bz) / 2));
+                    cbRef.current.onEvent?.('Collision! Wreckage is blocking the lane until cleared.', 'critical');
+                }
+            }
+        }
+
+        // render / cleanup
+        const surviving: Car[] = [];
+        for (const c of cars.current) {
+            const done = c.u > HALF;
+            const towed = c.crashed && c.wreckTimer <= 0;
+            if (done || towed) {
+                if (done && !c.crashed) { st.completed++; st.waitSamples.push(c.totalWait); if (st.waitSamples.length > 60) st.waitSamples.shift(); }
+                if (c.model && carGroup.current) carGroup.current.remove(c.model);
+                continue;
+            }
+            if (!c.model && carGroup.current) { c.model = buildCar(c.hue, c.type, c.len); carGroup.current.add(c.model); }
+            if (c.model) {
+                const [x, y, z] = worldPos(c);
+                c.model.position.set(x, y, z);
+                c.model.rotation.y = c.lane.axis === 'NS' ? (c.lane.sign === 1 ? 0 : Math.PI) : (c.lane.sign === 1 ? Math.PI / 2 : -Math.PI / 2);
+                const brake = c.model.getObjectByName('brake') as THREE.Mesh;
+                if (brake) (brake.material as THREE.MeshBasicMaterial).color.setHex(c.braking || c.crashed ? 0xff2020 : 0x330000);
+                if (c.crashed) {
+                    c.model.rotation.z = Math.sin(c.wreckTimer * 2) * 0.02;
+                    if (Math.random() < dt * 8) parts.current.push({ p: new THREE.Vector3(c.model.position.x, 1, c.model.position.z), vel: new THREE.Vector3(0, 1.2, 0), life: 1.8, max: 1.8, kind: 'smoke', s: 0.4 });
+                }
+            }
+            surviving.push(c);
+        }
+        cars.current = surviving;
+
+        // spawner
+        const target = Math.round((s.trafficDensity ?? 50) * 0.6);
+        st.spawnAcc += dt;
+        if (cars.current.length < target && st.spawnAcc > 0.25) { st.spawnAcc = 0; spawnCar(); }
+
+        // gridlock detection
+        const avgSpeed = movingCount ? speedSum / movingCount : 0;
+        if (movingCount > 12 && avgSpeed < 0.4 && t - st.gridlockAt > 20) {
+            st.gridlockAt = t;
+            cbRef.current.onEvent?.('Gridlock detected — network flow has collapsed. Try adaptive signals or a longer green.', 'warning');
+        }
+
+        // particles
+        const dummy = new THREE.Object3D();
+        const counts: Record<string, number> = { spark: 0, smoke: 0, debris: 0 };
+        const caps: Record<string, number> = { spark: 400, smoke: 400, debris: 150 };
+        const next: Particle[] = [];
+        for (const p of parts.current) {
+            p.life -= dt;
+            if (p.life <= 0) continue;
+            p.p.addScaledVector(p.vel, dt);
+            if (p.kind === 'debris') {
+                p.vel.y -= 9 * dt;
+                if (p.p.y < 0.15) { p.p.y = 0.15; p.vel.y *= -0.4; p.vel.x *= 0.7; p.vel.z *= 0.7; }
+            } else p.vel.multiplyScalar(1 - dt * 0.8);
+            const mesh = M.current[p.kind];
+            const idx = counts[p.kind];
+            if (mesh && idx < caps[p.kind]) {
+                const lifeR = p.life / p.max;
+                dummy.position.copy(p.p);
+                dummy.scale.setScalar(p.kind === 'smoke' ? p.s * (2 - lifeR) : p.s * lifeR);
+                dummy.rotation.set(p.life * 3, p.life * 5, 0);
+                dummy.updateMatrix();
+                mesh.setMatrixAt(idx, dummy.matrix);
+                counts[p.kind]++;
+            }
+            next.push(p);
+        }
+        parts.current = next;
+        dummy.position.set(0, -500, 0); dummy.scale.set(0, 0, 0); dummy.updateMatrix();
+        for (const k of ['spark', 'smoke', 'debris']) {
+            const mesh = M.current[k];
+            for (let i = counts[k]; i < caps[k]; i++) mesh.setMatrixAt(i, dummy.matrix);
             mesh.instanceMatrix.needsUpdate = true;
         }
 
-        hide(particleMeshRef.current, fireIdx, 2000);
-        hide(smokeMeshRef.current, smokeIdx, 2000);
-        hide(debrisMeshRef.current, debrisIdx, 500);
-        hide(flashMeshRef.current, flashIdx, 50);
-        hide(shockwaveMeshRef.current, shockwaveIdx, 50);
+        // hover: nearest intersection info
+        if (cbRef.current.onHover && Math.floor(ctx.wallTime * 10) % 2 === 0) {
+            const ints = ctx.raycaster.intersectObject(singles.current.plane);
+            let shown = false;
+            if (ints.length) {
+                const pt = ints[0].point;
+                for (let iz = 0; iz < 3; iz++) for (let ix = 0; ix < 3; ix++) {
+                    if (Math.abs(pt.x - ROAD_POS[ix]) < 6 && Math.abs(pt.z - ROAD_POS[iz]) < 6) {
+                        const ph = phaseAt(t, ix, iz);
+                        cbRef.current.onHover({
+                            x: ctx.mouse.x, y: ctx.mouse.y, visible: true,
+                            label: `Intersection ${ix + 1}-${iz + 1}`,
+                            data: [`NS: ${ph.ns === 'G' ? 'GREEN' : ph.ns === 'Y' ? 'YELLOW' : 'RED'}`, `EW: ${ph.ew === 'G' ? 'GREEN' : ph.ew === 'Y' ? 'YELLOW' : 'RED'}`, 'Click to switch phase'],
+                        });
+                        shown = true;
+                    }
+                }
+            }
+            if (!shown) cbRef.current.onHover({ x: 0, y: 0, visible: false, label: '' });
+        }
+
+        // metrics
+        st.metricAcc += dt || 0.016;
+        if (st.metricAcc > 0.5) {
+            st.metricAcc = 0;
+            const kmh = avgSpeed * (50 / 0.14 / 100); // invert of v0 scale → km/h approx
+            const throughput = ctx.time > 5 ? (st.completed / ctx.time) * 60 : 0;
+            const avgWait = st.waitSamples.length ? st.waitSamples.reduce((a, b) => a + b, 0) / st.waitSamples.length : 0;
+            cbRef.current.onUpdateMetrics([
+                { label: 'Vehicles', value: cars.current.length, status: 'neutral' },
+                { label: 'Avg Speed', value: Math.round(avgSpeed * 7.1), unit: 'km/h', status: avgSpeed < 1 && cars.current.length > 8 ? 'critical' : avgSpeed < 2.5 ? 'warning' : 'good', historyKey: 'speed' },
+                { label: 'Throughput', value: throughput.toFixed(0), unit: '/min', status: 'neutral', historyKey: 'throughput' },
+                { label: 'Waiting', value: waitingCount, status: waitingCount > 15 ? 'warning' : 'neutral' },
+                { label: 'Avg Delay', value: avgWait.toFixed(1), unit: 's', status: avgWait > 20 ? 'critical' : avgWait > 10 ? 'warning' : 'good' },
+                { label: 'Collisions', value: st.collisions, status: st.collisions > 0 ? 'critical' : 'good' },
+            ], { speed: Math.round(avgSpeed * 7.1), throughput: Math.round(throughput) });
+        }
     };
 
-    const onClick = () => {};
-    const mount = useThreeSim(init, animate, onClick, active, zoom);
+    const onClick = (ctx: SimContext) => {
+        const tool = toolRef.current;
+        const ints = ctx.raycaster.intersectObject(singles.current.plane);
+        if (!ints.length) return;
+        const pt = ints[0].point;
+        if (tool === 'spawn') {
+            for (let i = 0; i < 8; i++) setTimeout(() => spawnCar(), i * 120);
+            cbRef.current.onEvent?.('Traffic surge injected — 8 vehicles entering the network.', 'info');
+            return;
+        }
+        if (tool === 'clearWrecks') {
+            let n = 0;
+            for (const c of cars.current) if (c.crashed) { c.wreckTimer = 0; n++; }
+            if (n) cbRef.current.onEvent?.(`Tow trucks dispatched — ${n} wreck(s) cleared.`, 'good');
+            return;
+        }
+        // default: toggle nearest intersection phase
+        for (let iz = 0; iz < 3; iz++) for (let ix = 0; ix < 3; ix++) {
+            if (Math.abs(pt.x - ROAD_POS[ix]) < 7 && Math.abs(pt.z - ROAD_POS[iz]) < 7) {
+                const s = settingsRef.current;
+                const g = Math.max(2, s.greenDuration ?? 6);
+                inter.current[iz * 3 + ix].override += g + 1.2; // jump half cycle
+                cbRef.current.onEvent?.(`Manual override: intersection ${ix + 1}-${iz + 1} phase switched.`, 'info');
+            }
+        }
+    };
+
+    const mount = useThreeSim({
+        init, animate, onClick,
+        active, zoom: zoom ?? 1.3, timeScale,
+        cameraType: 'perspective',
+        cameraPos: [46, 42, 46],
+        leftOrbits: false,
+        background: 0xcfe2f3,
+    });
+
     return <div ref={mount} className="w-full h-full" />;
 });
