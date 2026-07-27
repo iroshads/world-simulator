@@ -49,7 +49,7 @@ interface SliderProps {
 export const Slider: React.FC<SliderProps> = ({ label, value, min, max, step = 1, unit = '', desc, onChange }) => {
     const pct = ((value - min) / (max - min)) * 100;
     return (
-        <div className="mb-4.5 mb-5 select-none group" title={desc}>
+        <div className="mb-5 select-none group" title={desc}>
             <div className="flex justify-between items-center mb-2">
                 <label className="text-[11px] font-semibold text-slate-600 group-hover:text-slate-900 transition-colors">{label}</label>
                 <span className="text-[10px] font-mono font-bold text-slate-700 bg-gradient-to-r from-cyan-50 to-violet-50 px-2 py-0.5 rounded-full border border-slate-200/80 min-w-[38px] text-center shadow-sm">{value}{unit}</span>

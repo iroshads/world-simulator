@@ -4,11 +4,12 @@ import { AutonomySim } from './components/simulations/AutonomySim';
 import { SocialSim } from './components/simulations/SocialSim';
 import { RoboticsSim } from './components/simulations/RoboticsSim';
 import { Button, Slider, Segmented, Sparkline } from './components/UI';
+import { Logo } from './components/Logo';
 import { DomainId, DomainTab, SimMetric, SimInteraction, SimTool, SimEvent, ControlGroup, Preset } from './types';
 import {
     Globe, Car, Users, Bot, Home, Factory, Building2, Ban, Eraser, MousePointer2,
     Route, TreePine, Zap, Flame, Crosshair, Radio, ShieldCheck, Package, Plus, Minus,
-    Play, Pause, Gauge, RefreshCw, RotateCcw, Activity, Layers, ZoomIn, ZoomOut, Orbit, Sparkles,
+    Play, Pause, Gauge, RefreshCw, RotateCcw, Activity, Layers, ZoomIn, ZoomOut,
 } from 'lucide-react';
 
 /** per-domain starting zoom — city & warehouse read best up close */
@@ -274,16 +275,7 @@ function App() {
         <div className="h-screen w-full flex flex-col bg-transparent text-slate-800 overflow-hidden">
             {/* ---------- header ---------- */}
             <header className="h-14 px-5 flex-shrink-0 flex items-center gap-5 border-b border-slate-200 bg-white/80 backdrop-blur-md z-40 shadow-sm">
-                <div className="flex items-center gap-2.5 select-none flex-shrink-0">
-                    <div className="relative w-9 h-9 rounded-2xl bg-gradient-to-br from-cyan-400 via-sky-500 to-violet-600 flex items-center justify-center shadow-lg shadow-violet-500/30 ring-1 ring-white/50">
-                        <Orbit size={18} className="text-white" strokeWidth={2.2} />
-                        <Sparkles size={10} className="absolute -top-1 -right-1 text-amber-400 fill-amber-300" />
-                    </div>
-                    <div className="leading-tight">
-                        <h1 className="text-[15px] font-extrabold tracking-tight bg-gradient-to-r from-slate-900 via-slate-700 to-slate-500 bg-clip-text text-transparent">World Simulator</h1>
-                        <span className="text-[9px] text-slate-400 font-medium tracking-[0.14em]">MULTI-AGENT SANDBOX</span>
-                    </div>
-                </div>
+                <Logo />
 
                 {/* tabs */}
                 <nav className="flex gap-1 bg-slate-100/70 border border-slate-200/70 rounded-full p-1">

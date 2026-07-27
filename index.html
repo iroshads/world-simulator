@@ -3,7 +3,56 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>World Simulator — Live Multi-Agent Sandbox</title>
+
+    <!-- Primary -->
+    <title>World Simulator — Real-Time Multi-Agent Simulation Sandbox</title>
+    <meta name="description" content="Run live multi-agent simulations in your browser: build a city with real supply-and-demand economics, tune a traffic network running IDM physics, command an autonomous robot fleet, and watch echo chambers emerge in a social graph." />
+    <meta name="author" content="Irosha de Silva" />
+    <meta name="keywords" content="simulation, multi-agent simulation, city builder, traffic simulation, agent-based modeling, robotics simulation, social network simulation, three.js, digital twin, sandbox" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+    <meta name="theme-color" content="#0b1220" />
+    <link rel="canonical" href="https://world-simulator-indol.vercel.app/" />
+
+    <!-- Icons -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/favicon-192.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="World Simulator" />
+    <meta property="og:title" content="World Simulator — Real-Time Multi-Agent Simulation Sandbox" />
+    <meta property="og:description" content="Build a living city, tune a traffic network, command a robot fleet, and watch echo chambers emerge — four live agent-based simulations running in your browser." />
+    <meta property="og:url" content="https://world-simulator-indol.vercel.app/" />
+    <meta property="og:image" content="https://world-simulator-indol.vercel.app/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="World Simulator: an isometric 3D city simulation with live control panel." />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="World Simulator — Real-Time Multi-Agent Simulation Sandbox" />
+    <meta name="twitter:description" content="Build a living city, tune a traffic network, command a robot fleet, and watch echo chambers emerge — four live agent-based simulations in your browser." />
+    <meta name="twitter:image" content="https://world-simulator-indol.vercel.app/og-image.png" />
+
+    <!-- Structured data -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebApplication",
+      "name": "World Simulator",
+      "url": "https://world-simulator-indol.vercel.app/",
+      "description": "A real-time, browser-based sandbox for multi-agent simulation across four domains: city growth, traffic networks, autonomous robot fleets, and social opinion dynamics.",
+      "applicationCategory": "SimulationApplication",
+      "operatingSystem": "Any (web browser)",
+      "browserRequirements": "Requires WebGL",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "author": { "@type": "Person", "name": "Irosha de Silva", "url": "https://www.irosha.com" }
+    }
+    </script>
+
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
       tailwind.config = {
@@ -17,6 +66,8 @@
         }
       }
     </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
       body {
@@ -48,12 +99,53 @@
       }
       .ticker-in { animation: tickerIn 0.3s ease both; }
 
-      input[type="range"] { -webkit-appearance: none; appearance: none; background: transparent; }
-      input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; }
+      /*
+        Range inputs are rendered invisible and layered over custom track/thumb
+        visuals. The native thumb still needs explicit dimensions — a thumb with
+        `appearance: none` and no size collapses to zero width and cannot be
+        grabbed, which silently breaks dragging.
+      */
+      input[type="range"] {
+        -webkit-appearance: none;
+        appearance: none;
+        background: transparent;
+        pointer-events: auto;
+        touch-action: none;
+      }
+      input[type="range"]::-webkit-slider-runnable-track {
+        height: 100%;
+        background: transparent;
+        border: none;
+      }
+      input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        background: transparent;
+        border: none;
+        cursor: grab;
+      }
+      input[type="range"]:active::-webkit-slider-thumb { cursor: grabbing; }
+      input[type="range"]::-moz-range-track {
+        height: 100%;
+        background: transparent;
+        border: none;
+      }
+      input[type="range"]::-moz-range-thumb {
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        background: transparent;
+        border: none;
+        cursor: grab;
+      }
     </style>
   </head>
   <body>
     <div id="root"></div>
+    <noscript>World Simulator is an interactive WebGL simulation and requires JavaScript to run.</noscript>
     <script type="module" src="/index.tsx"></script>
   </body>
 </html>
