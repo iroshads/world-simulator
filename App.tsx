@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { WorldSim } from './components/simulations/WorldSim';
+import { WorldSim, WORLD_SAVE_KEY } from './components/simulations/WorldSim';
 import { AutonomySim } from './components/simulations/AutonomySim';
 import { SocialSim } from './components/simulations/SocialSim';
 import { RoboticsSim } from './components/simulations/RoboticsSim';
-import { Button, Slider, Segmented, Sparkline } from './components/UI';
+import { Button, Slider, Segmented, Sparkline, DemandBar } from './components/UI';
 import { Logo } from './components/Logo';
 import { DomainId, DomainTab, SimMetric, SimInteraction, SimTool, SimEvent, ControlGroup, Preset } from './types';
 import {
@@ -314,7 +314,12 @@ function App() {
                 <div className="flex items-center gap-1">
                     <Button variant="ghost" size="sm" icon={ZoomIn} onClick={() => setZoom(z => Math.min(4, z + 0.25))} title="Zoom in (+)" />
                     <Button variant="ghost" size="sm" icon={ZoomOut} onClick={() => setZoom(z => Math.max(0.5, z - 0.25))} title="Zoom out (−)" />
-                    <Button variant="secondary" size="sm" icon={RefreshCw} onClick={() => { setEpoch(e => e + 1); setEvents([]); historyRef.current[activeTab] = {}; }} title="Regenerate simulation">
+                    <Button variant="secondary" size="sm" icon={RefreshCw}
+                        onClick={() => {
+                            if (activeTab === DomainId.WORLD) { try { localStorage.removeItem(WORLD_SAVE_KEY); } catch { /* ignore */ } }
+                            setEpoch(e => e + 1); setEvents([]); historyRef.current[activeTab] = {};
+                        }}
+                        title="Regenerate simulation (clears the world autosave)">
                         New Run
                     </Button>
                 </div>
@@ -422,10 +427,28 @@ function App() {
                                     { id: 'none', label: 'Map' },
                                     { id: 'value', label: 'Value' },
                                     { id: 'pollution', label: 'Smog' },
+                                    { id: 'traffic', label: 'Flow' },
                                     { id: 'happiness', label: 'Mood' },
                                 ]} />
                             </div>
                         )}
+
+                        {/* zone demand (world only) */}
+                        {activeTab === DomainId.WORLD && (() => {
+                            const last = (k: string) => { const a = hist[k]; return a?.length ? a[a.length - 1] : 0; };
+                            const toPct = (v: number) => (v + 100) / 2;
+                            return (
+                                <div>
+                                    <h3 className="text-[10px] font-bold text-slate-400 tracking-wider mb-2">Zone Demand</h3>
+                                    <div className="space-y-1.5 bg-white border border-slate-200/80 rounded-2xl p-3 shadow-sm">
+                                        <DemandBar label="R" value={toPct(last('demandR'))} color="#10b981" />
+                                        <DemandBar label="C" value={toPct(last('demandC'))} color="#06b6d4" />
+                                        <DemandBar label="I" value={toPct(last('demandI'))} color="#f59e0b" />
+                                        <p className="text-[9px] text-slate-400 pt-1 leading-tight">Above the midpoint = citizens want more of that zone.</p>
+                                    </div>
+                                </div>
+                            );
+                        })()}
 
                         {/* presets */}
                         {PRESETS[activeTab] && (

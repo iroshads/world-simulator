@@ -42,7 +42,17 @@ interface Cell {
     powered: boolean;
     access: boolean;
     fire: number;    // burn timer (sim seconds remaining), 0 = not burning
+    traffic: number; // per-road-cell congestion load (decays each tick)
 }
+
+export const WORLD_SAVE_KEY = 'ws:world:v1';
+
+const SEASONS = [
+    { name: 'SPRING', grass: 0x86efac, grassMix: 0.10, tree: 0x46a854, forestTile: 0x3d8f4c, growth: 1.15 },
+    { name: 'SUMMER', grass: 0x86efac, grassMix: 0.0, tree: 0x1f6e33, forestTile: 0x2f7d3f, growth: 1.0 },
+    { name: 'AUTUMN', grass: 0xd6b45c, grassMix: 0.30, tree: 0xc0742a, forestTile: 0x8f6b2e, growth: 0.9 },
+    { name: 'WINTER', grass: 0xe6edf4, grassMix: 0.55, tree: 0x9fb3bd, forestTile: 0x7d8f9c, growth: 0.55 },
+];
 
 interface Car { path: number[]; seg: number; t: number; speed: number; hue: number; }
 interface Ped { cell: number; next: number; t: number; speed: number; hue: number; skin: number; off: number; }
@@ -73,7 +83,7 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
         powerCap: 0, powerDemand: 0,
         day: 1, clock: '06:00', weather: 'CLEAR' as 'CLEAR' | 'CLOUDY' | 'RAIN',
         weatherTimer: 30, rainF: 0, // eased rain factor 0..1
-        tickAcc: 0, metricAcc: 0, spawnAcc: 0,
+        tickAcc: 0, metricAcc: 0, spawnAcc: 0, saveAcc: 0, season: 1,
         roadsDirty: true, colorsDirty: true,
         lastPaint: -1,
         eventCooldown: {} as Record<string, number>,
@@ -106,8 +116,46 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
         cbRef.current.onEvent?.(text, sev);
     };
 
+    // ---------- persistence ----------
+    const saveCity = () => {
+        try {
+            const cells = grid.current;
+            localStorage.setItem(WORLD_SAVE_KEY, JSON.stringify({
+                v: 1,
+                treasury: Math.round(state.current.treasury),
+                t: cells.map(c => c.type),
+                l: cells.map(c => Math.round(c.level * 10) / 10),
+                e: cells.map(c => Math.round(c.elev * 100) / 100),
+                s: cells.map(c => Math.round(c.seed * 100) / 100),
+            }));
+        } catch { /* storage full or unavailable — skip silently */ }
+    };
+
+    const restoreCity = (): boolean => {
+        try {
+            const raw = localStorage.getItem(WORLD_SAVE_KEY);
+            if (!raw) return false;
+            const d = JSON.parse(raw);
+            if (d?.v !== 1 || !Array.isArray(d.t) || d.t.length !== N) return false;
+            grid.current = d.t.map((type: number, i: number) => ({
+                type, level: d.l[i] ?? 0, anim: d.l[i] ?? 0,
+                elev: d.e[i] ?? 0.3, seed: d.s[i] ?? 0.5,
+                pollution: 0, value: 50, happy: 60,
+                powered: false, access: false, fire: 0, traffic: 0,
+            }));
+            state.current.treasury = typeof d.treasury === 'number' ? d.treasury : 25000;
+            state.current.roadsDirty = true;
+            state.current.colorsDirty = true;
+            return true;
+        } catch { return false; }
+    };
+
     // ---------- world generation ----------
     const generate = () => {
+        if (restoreCity()) {
+            fireEvent('restore', 'City restored from autosave — welcome back, mayor.', 'good', 2);
+            return;
+        }
         const rng = mulberry32(1337);
         const elevN = makeNoise(mulberry32(11));
         const moistN = makeNoise(mulberry32(23));
@@ -127,7 +175,7 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
             cells.push({
                 type, level: type === T.FOREST ? 1 + rng() : 0, anim: 0,
                 elev: Math.max(0.15, elev), seed: rng(),
-                pollution: 0, value: 50, happy: 60, powered: false, access: false, fire: 0,
+                pollution: 0, value: 50, happy: 60, powered: false, access: false, fire: 0, traffic: 0,
             });
         }
         // starter town: crossroads + small zoned core + power plant
@@ -394,7 +442,7 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
         const cells = grid.current;
         const s = state.current;
         const set = settingsRef.current;
-        const growth = (set.growthSpeed ?? 50) / 50;
+        const growth = ((set.growthSpeed ?? 50) / 50) * SEASONS[s.season].growth;
         const tax = set.taxRate ?? 12;
         const services = (set.cityServices ?? 50);
         const rainF = s.rainF;
@@ -402,6 +450,7 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
         let pop = 0, jobs = 0, comCap = 0, indCap = 0;
         let happySum = 0, happyCount = 0, valueSum = 0, valueCount = 0, pollSum = 0;
         let powerDemand = 0;
+        let trafficSum = 0, roadCount = 0;
 
         // pollution diffusion buffer
         const nextPol = new Float32Array(N);
@@ -410,10 +459,15 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
             const c = cells[i];
             const gx = i % SIZE, gz = Math.floor(i / SIZE);
 
-            // emissions
+            // emissions — roads pollute where the traffic actually is
             let emit = 0;
             if (c.type === T.IND) emit = 1.6 * c.level;
-            if (c.type === T.ROAD) emit = 0.35 * (s.congestion / 50 + 0.4);
+            if (c.type === T.ROAD) {
+                c.traffic *= 0.88; // congestion cools off when cars stop coming
+                if (c.traffic < 0.02) c.traffic = 0;
+                emit = Math.min(1.6, 0.1 + c.traffic * 0.14);
+                trafficSum += c.traffic; roadCount++;
+            }
             if (c.fire > 0) emit = 4;
             let absorb = 0;
             if (c.type === T.FOREST || c.type === T.PARK) absorb = 2.2;
@@ -499,6 +553,7 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
         for (let i = 0; i < N; i++) cells[i].pollution = nextPol[i];
 
         jobs = comCap + indCap;
+        s.congestion = Math.min(100, (roadCount ? trafficSum / roadCount : 0) * 24);
         s.pop = pop; s.jobs = jobs;
         s.happiness = happyCount ? happySum / happyCount : 60;
         s.avgValue = valueCount ? valueSum / valueCount : 50;
@@ -559,25 +614,36 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
         const cells = grid.current;
         const col = new THREE.Color();
         const ov = overlayRef.current;
+        const season = SEASONS[state.current.season];
+        const seasonGrass = new THREE.Color(season.grass);
+        const congested = new THREE.Color(0xc2492e);
         for (let i = 0; i < N; i++) {
             const c = cells[i];
             if (ov && ov !== 'none' && c.type !== T.WATER) {
                 if (ov === 'pollution') col.copy(heatColor(c.pollution, true));
                 else if (ov === 'value') col.copy(heatColor(c.value));
-                else col.copy(heatColor(ZONES.includes(c.type) ? c.happy : 50));
+                else if (ov === 'traffic') {
+                    if (c.type === T.ROAD) col.copy(heatColor(Math.min(100, c.traffic * 14), true));
+                    else col.setHex(0x333a45);
+                } else col.copy(heatColor(ZONES.includes(c.type) ? c.happy : 50));
             } else {
                 switch (c.type) {
                     case T.WATER: col.setHex(0x0a5c8f); break;
                     case T.SAND: col.setHex(0xd9c58a); break;
-                    case T.FOREST: col.setHex(0x2f7d3f); break;
-                    case T.ROAD: col.setHex(0x353c47); break;
-                    case T.PARK: col.setHex(0x4cae54); break;
+                    case T.FOREST: col.setHex(season.forestTile); break;
+                    case T.ROAD:
+                        col.setHex(0x353c47);
+                        // busy roads visibly run hot
+                        col.lerp(congested, Math.min(1, c.traffic / 9) * 0.75);
+                        break;
+                    case T.PARK: col.setHex(0x4cae54).lerp(seasonGrass, season.grassMix * 0.5); break;
                     case T.POWER: col.setHex(0x565f6e); break;
                     case T.RUBBLE: col.setHex(0x51473d); break;
                     case T.RES: case T.COM: case T.IND: col.setHex(0x9aa3ad); break;
                     default: {
                         const g = 0.72 + c.seed * 0.1 + c.elev * 0.18;
                         col.setRGB(0.36 * g, 0.62 * g, 0.32 * g);
+                        col.lerp(seasonGrass, season.grassMix);
                     }
                 }
                 if (c.fire > 0) col.lerp(new THREE.Color(0xff3300), 0.45);
@@ -685,6 +751,19 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
         const hh = Math.floor(tDay * 24), mm = Math.floor((tDay * 24 % 1) * 60);
         s.clock = `${hh.toString().padStart(2, '0')}:${mm.toString().padStart(2, '0')}`;
 
+        // seasons roll over every in-game day
+        const newSeason = (s.day - 1) % 4;
+        if (newSeason !== s.season) {
+            s.season = newSeason;
+            s.colorsDirty = true;
+            const flavor = ['Spring — growth surges and the valley blooms.', 'Summer — long bright days, business as usual.', 'Autumn — the forests turn amber, growth cools.', 'Winter — snow slows construction to a crawl.'][newSeason];
+            fireEvent('season' + s.day, `${SEASONS[newSeason].name}: ${flavor}`, 'info', 2);
+        }
+
+        // autosave the city so it survives reloads and tab switches
+        s.saveAcc += dt;
+        if (s.saveAcc > 8) { s.saveAcc = 0; saveCity(); }
+
         // weather easing
         const targetRain = s.weather === 'RAIN' ? 1 : 0;
         s.rainF += (targetRain - s.rainF) * Math.min(1, dt * 0.8);
@@ -731,20 +810,26 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
             });
         }
 
-        // rain particles
+        // rain particles (snow in winter: white, drifting, slow)
+        const isWinter = s.season === 3;
         const rainMesh = M.current.rain;
         rainMesh.visible = s.rainF > 0.05;
         if (rainMesh.visible) {
+            const rm = rainMesh.material as THREE.MeshBasicMaterial;
+            rm.color.setHex(isWinter ? 0xffffff : 0xa8c5e6);
+            rm.opacity = isWinter ? 0.8 : 0.35;
             const drops = singles.current.rainDrops;
             const dummy = new THREE.Object3D();
             const visN = Math.floor(RAIN_N * s.rainF);
             for (let i = 0; i < RAIN_N; i++) {
                 const d = drops[i];
                 if (i < visN) {
-                    d.y -= dt * 32;
+                    d.y -= dt * (isWinter ? 7 : 32);
+                    if (isWinter) d.x += Math.sin(ctx.wallTime * 1.5 + i) * dt * 1.5;
                     if (d.y < 0) { d.y = 26 + Math.random() * 6; d.x = (Math.random() - 0.5) * SIZE * 1.2; d.z = (Math.random() - 0.5) * SIZE * 1.2; }
                     dummy.position.set(d.x, d.y, d.z);
-                    dummy.scale.set(1, 1, 1);
+                    if (isWinter) dummy.scale.set(4, 0.16, 4); // flakes, not streaks
+                    else dummy.scale.set(1, 1, 1);
                 } else { dummy.position.set(0, -500, 0); dummy.scale.set(0, 0, 0); }
                 dummy.updateMatrix();
                 rainMesh.setMatrixAt(i, dummy.matrix);
@@ -773,7 +858,17 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
                 let h = 0, w = 0.82;
                 if (c.type === T.RES) { h = 0.35 + lvl * 0.28; bCol.setHex(0xf1ede4); }
                 else if (c.type === T.COM) { h = 0.3 + lvl * 0.5; bCol.setHex(0x6fd7f0); }
-                else { h = 0.3 + lvl * 0.3; w = 0.9; bCol.setHex(0xe8b06a); }
+                else {
+                    h = 0.3 + lvl * 0.3; w = 0.9; bCol.setHex(0xe8b06a);
+                    // working factories puff smoke
+                    if (lvl > 1.4 && c.powered && !s.blackout && Math.random() < dt * 0.7 && smoke.current.length < MAX_SMOKE - 20) {
+                        smoke.current.push({
+                            p: new THREE.Vector3(x + 0.25, topY + h + 0.15, z + 0.25),
+                            v: new THREE.Vector3(0.25 + Math.random() * 0.2, 0.9 + Math.random() * 0.5, (Math.random() - 0.5) * 0.2),
+                            life: 2.2, max: 2.2,
+                        });
+                    }
+                }
                 bCol.multiplyScalar(0.9 + c.seed * 0.18); // subtle per-building variance
                 if (c.fire > 0) bCol.lerp(new THREE.Color(0x331111), 0.6);
                 else if (!c.powered || s.blackout) bCol.multiplyScalar(0.6);
@@ -807,7 +902,11 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
                 dummy.rotation.set(0, c.seed * 3, 0);
                 dummy.updateMatrix();
                 trMesh.setMatrixAt(i, dummy.matrix);
-                trMesh.setColorAt(i, bCol.setHex(c.type === T.PARK ? 0x35c04b : 0x1f6e33));
+                // foliage follows the season; parks stay a touch greener
+                bCol.setHex(SEASONS[s.season].tree);
+                if (c.type === T.PARK) bCol.lerp(new THREE.Color(0x35c04b), 0.45);
+                bCol.multiplyScalar(0.85 + c.seed * 0.3);
+                trMesh.setColorAt(i, bCol);
                 tSet = true;
             }
 
@@ -914,14 +1013,19 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
             }
         }
         const carMesh = M.current.car;
-        const congestionBase = roadCellsRef.current.length > 0 ? cars.current.length / roadCellsRef.current.length : 0;
-        s.congestion = Math.min(100, congestionBase * 240);
-        const speedMult = Math.max(0.3, 1 - congestionBase * 1.8) * (1 - s.rainF * 0.3);
+        const weatherMult = (1 - s.rainF * 0.3) * (isWinter ? 0.8 : 1);
         const nextCars: Car[] = [];
         let ci = 0;
         const carCol = new THREE.Color();
         for (const car of cars.current) {
-            car.t += dt * car.speed * speedMult;
+            // each car loads the road tile it is on; heavy tiles slow everyone there
+            const hereCell = cells[car.path[car.seg]];
+            if (hereCell) {
+                hereCell.traffic = Math.min(12, hereCell.traffic + dt * 2.6);
+                car.t += dt * car.speed * weatherMult / (1 + hereCell.traffic * 0.1);
+            } else {
+                car.t += dt * car.speed * weatherMult;
+            }
             while (car.t >= 1 && car.seg < car.path.length - 2) { car.t -= 1; car.seg++; }
             if (car.seg >= car.path.length - 2 && car.t >= 1) continue; // arrived
             const [ax, az] = idx2xz(car.path[car.seg]);
@@ -1023,7 +1127,7 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
                 if (ZONES.includes(c.type)) {
                     data.push(`Level: ${c.level.toFixed(1)}`, `Happiness: ${Math.round(c.happy)}%`, `Land value: ${Math.round(c.value)}`,
                         `Pollution: ${Math.round(c.pollution)}`, `Power: ${c.powered && !s.blackout ? 'OK' : 'NONE'}`, `Road access: ${c.access ? 'YES' : 'NO'}`);
-                } else if (c.type === T.ROAD) data.push(`Traffic: ${Math.round(s.congestion)}% load`);
+                } else if (c.type === T.ROAD) data.push(`Local traffic: ${Math.round(Math.min(100, c.traffic * 14))}%`, `Network avg: ${Math.round(s.congestion)}%`);
                 else if (c.type === T.POWER) data.push(`Capacity: 420 units`, `Grid: ${Math.round(s.powerDemand)}/${Math.round(s.powerCap)}`);
                 if (c.fire > 0) data.push('🔥 ON FIRE');
                 cbRef.current.onHover({ x: ctx.mouse.x, y: ctx.mouse.y, visible: true, label: names[c.type] ?? '?', data });
@@ -1043,9 +1147,12 @@ export const WorldSim: React.FC<SimProps> = React.memo(({ settings, activeTool, 
                 { label: 'Traffic', value: Math.round(s.congestion), unit: '%', status: s.congestion > 60 ? 'warning' : 'neutral' },
                 { label: 'Grid', value: s.blackout ? 'OVERLOAD' : `${Math.round((s.powerDemand / Math.max(1, s.powerCap)) * 100)}%`, status: s.blackout ? 'critical' : 'good' },
                 { label: 'Day ' + s.day, value: s.clock, status: 'neutral' },
-                { label: 'Weather', value: s.weather, status: s.weather === 'RAIN' ? 'warning' : 'neutral' },
-                { label: 'Demand', value: `R${Math.round(s.demandR)} C${Math.round(s.demandC)} I${Math.round(s.demandI)}`, status: 'neutral' },
-            ], { pop: s.pop, treasury: Math.round(s.treasury), happy: Math.round(s.happiness), pollution: Math.round(s.avgPollution) });
+                { label: 'Season', value: SEASONS[s.season].name, status: 'neutral' },
+                { label: 'Weather', value: s.weather === 'RAIN' && s.season === 3 ? 'SNOW' : s.weather, status: s.weather === 'RAIN' ? 'warning' : 'neutral' },
+            ], {
+                pop: s.pop, treasury: Math.round(s.treasury), happy: Math.round(s.happiness), pollution: Math.round(s.avgPollution),
+                demandR: Math.round(s.demandR), demandC: Math.round(s.demandC), demandI: Math.round(s.demandI),
+            });
         }
     };
 
